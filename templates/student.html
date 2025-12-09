@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Student Group Mic</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-white flex flex-col items-center justify-center h-screen">
+    <h1 class="text-3xl mb-4">Group Discussion Mic</h1>
+    <div class="mb-4">
+        <label class="mr-2">Group ID:</label>
+        <input id="groupId" type="text" value="Group-A" class="text-black p-2 rounded"/>
+    </div>
+    
+    <button id="btn" onclick="toggle()" class="bg-green-600 px-8 py-8 rounded-full text-xl font-bold">
+        Start
+    </button>
+    <div id="status" class="mt-4 text-gray-400">Ready</div>
+
+    <script>
+        let socket;
+        let mediaRecorder;
+        let isRecording = false;
+
+        async function toggle() {
+            const btn = document.getElementById('btn');
+            const status = document.getElementById('status');
+            const gid = document.getElementById('groupId').value || 'Group-A';
+
+            if (!isRecording) {
+                const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+                socket = new WebSocket(`${protocol}://${window.location.host}/ws/student/${gid}`);
+                
+                socket.onopen = async () => {
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+                    
+                    mediaRecorder.ondataavailable = (event) => {
+                        if (event.data.size > 0 && socket.readyState === WebSocket.OPEN) {
+                            socket.send(event.data);
+                        }
+                    };
+                    
+                    mediaRecorder.start(1000); // send chunks every second
+                    isRecording = true;
+                    btn.innerText = "STOP";
+                    btn.classList.replace('bg-green-600', 'bg-red-600');
+                    status.innerText = "Transmitting...";
+                };
+
+                socket.onclose = () => {
+                    status.innerText = "Connection closed";
+                };
+            } else {
+                mediaRecorder.stop();
+                socket.close();
+                isRecording = false;
+                btn.innerText = "Start";
+                btn.classList.replace('bg-red-600', 'bg-green-600');
+                status.innerText = "Stopped";
+            }
+        }
+    </script>
+</body>
+</html>

@@ -55,7 +55,7 @@ class SessionResponse(BaseModel):
 class IngestEvent(BaseModel):
     text: str
     lang: Optional[str] = None
-    speaker: Optional[str] = None
+    speaker: Optional[object] = None  # accept int/str
     timestamp: Optional[float] = None
     source: str = "wlk"
     raw_payload: Optional[dict] = None
@@ -150,7 +150,8 @@ async def websocket_student(websocket: WebSocket, group_id: str):
 
 async def process_event(group_id: str, event: IngestEvent, session) -> Dict:
     ts = event.timestamp or time.time()
-    speaker = event.speaker or "unknown"
+    speaker_val = event.speaker
+    speaker = str(speaker_val) if speaker_val is not None else "unknown"
     lang = event.lang or "unknown"
     if event.raw_payload is not None:
         logger.info("Raw WLK payload for %s (speaker=%s): %s", group_id, speaker, event.raw_payload)

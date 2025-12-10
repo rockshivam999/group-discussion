@@ -209,7 +209,7 @@ export default function StudentPage() {
         body: JSON.stringify({
           text: entry.text,
           lang: entry.lang,
-          speaker: entry.speaker,
+          speaker: entry.speaker != null ? String(entry.speaker) : "unknown",
           timestamp: entry.timestamp,
           source: "wlk",
           raw_payload: rawPayload,

@@ -7,12 +7,13 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from .analysis import analyze_text, compute_dominance, encode_topic
+from .analysis import analyze_text, compute_dominance, encode_topic, collapse_repetitions
 from .config import (
     CORS_ALLOW_ORIGINS,
     DEFAULT_ALLOWED_LANGUAGE,
     DEFAULT_TARGET_DESCRIPTION,
     DEFAULT_TARGET_TOPIC,
+    MERGE_WINDOW_SECONDS,
 )
 from .connections import ConnectionManager
 from .sessions import GroupRegistry
@@ -57,6 +58,7 @@ class IngestEvent(BaseModel):
     speaker: Optional[str] = None
     timestamp: Optional[float] = None
     source: str = "wlk"
+    raw_payload: Optional[dict] = None
 
 
 @app.get("/")
@@ -148,12 +150,16 @@ async def websocket_student(websocket: WebSocket, group_id: str):
 
 async def process_event(group_id: str, event: IngestEvent, session) -> Dict:
     ts = event.timestamp or time.time()
+    speaker = event.speaker or "unknown"
+    lang = event.lang or "unknown"
+    if event.raw_payload is not None:
+        logger.info("Raw WLK payload for %s (speaker=%s): %s", group_id, speaker, event.raw_payload)
     base_entry: Dict = {
         "group_id": group_id,
         "source": event.source or "wlk",
-        "speaker": event.speaker,
-        "text": event.text,
-        "lang": event.lang or "unknown",
+        "speaker": speaker,
+        "text": collapse_repetitions(event.text or ""),
+        "lang": lang,
         "timestamp": ts,
         "target_topic": session.topic,
         "target_description": session.description,
@@ -161,14 +167,34 @@ async def process_event(group_id: str, event: IngestEvent, session) -> Dict:
     }
 
     alerts, topic_score = analyze_text(
-        text=event.text,
-        language=event.lang or "unknown",
+        text=base_entry["text"],
+        language=lang,
         target_embedding=session.target_embedding,
         target_topic=session.topic,
         allowed_language=session.allowed_language,
     )
+    logger.info("Raw transcript event for %s (speaker=%s): %s", group_id, speaker, event.text)
 
-    prospective_history = registry.get_history(group_id) + [base_entry]
+    history = registry.get_history(group_id)
+    merged = False
+    if history:
+        last = history[-1]
+        same_speaker = (last.get("speaker") or "unknown") == speaker
+        close_in_time = ts - (last.get("timestamp") or 0) < MERGE_WINDOW_SECONDS
+        if same_speaker and close_in_time:
+            prev_text = (last.get("text") or "").strip()
+            curr_text = (event.text or "").strip()
+            if curr_text.startswith(prev_text):
+                merged_text = curr_text
+            elif prev_text.startswith(curr_text):
+                merged_text = prev_text
+            else:
+                merged_text = f"{prev_text} {curr_text}".strip()
+            base_entry["text"] = merged_text
+            merged = True
+            history[-1] = base_entry
+
+    prospective_history = (history if merged else history + [base_entry]) if history is not None else [base_entry]
     dominance_state, dominance_speaker = compute_dominance(prospective_history)
 
     entry = {
@@ -182,9 +208,12 @@ async def process_event(group_id: str, event: IngestEvent, session) -> Dict:
         "chunk_seconds": None,
     }
 
-    registry.append_history(group_id, entry)
+    if merged:
+        registry.update_last(group_id, entry)
+    else:
+        registry.append_history(group_id, entry)
     await manager.broadcast_alert(entry)
-    logger.info("Ingested event for %s: %s", group_id, entry)
+    logger.info("Ingested event for %s (merged=%s): %s", group_id, merged, entry)
     return entry
 
 

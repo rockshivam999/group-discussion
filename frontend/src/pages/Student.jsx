@@ -23,7 +23,16 @@ export default function StudentPage() {
   const analysisSocketRef = useRef(null);
   const [wlkTranscripts, setWlkTranscripts] = useState([]);
   const [analysisTranscripts, setAnalysisTranscripts] = useState([]);
+  const currentBufferRef = useRef({ speaker: null, text: "", ts: 0 });
   const navigate = useNavigate();
+  const SILENCE_SPLIT_SECONDS = 10;
+
+  const cleanText = (t) => {
+    if (!t) return "";
+    let cleaned = t.replace(/\b(\w+)(?:\s+\1\b){2,}/gi, "$1 $1");
+    cleaned = cleaned.replace(/(\b[\w'-]+(?:\s+[\w'-]+){2,7})\s+(?:\1\s*){1,}/gi, "$1");
+    return cleaned.trim();
+  };
 
   const startRecording = async () => {
     const gid = groupId.trim();
@@ -115,28 +124,71 @@ export default function StudentPage() {
           payload = { text: event.data };
         }
 
-        // WhisperLiveKit emits FrontData: {status, lines: [{text, speaker,...}], buffer_transcription, buffer_diarization, ...}
-        const lineTexts = (payload.lines || []).map((l) => l.text).filter(Boolean);
-        const lineSpeaker = (payload.lines || []).find((l) => l.text)?.speaker;
-        const lineLang = (payload.lines || []).find((l) => l.detected_language)?.detected_language;
-        const text =
-          payload.text ||
-          payload.transcript ||
-          (lineTexts.length ? lineTexts.join(" ") : payload.buffer_transcription || "");
+        // Prefer finalized lines; fall back to buffer_transcription when lines are empty
+        const lines = payload.lines || [];
+        const latest = lines.find((l) => l.text);
+        const fallbackBuffer = (payload.buffer_transcription || payload.text || payload.transcript || "").trim();
+        const rawText = (latest && latest.text ? latest.text : fallbackBuffer).trim();
+        const text = cleanText(rawText);
+        if (!text) return;
 
-        if (!text || !text.trim()) return;
+        const lineSpeaker = latest?.speaker;
+        const lineLang = latest?.detected_language;
 
+        const ts = payload.timestamp || Date.now() / 1000;
+        const speaker = payload.speaker || payload.spk || lineSpeaker || currentBufferRef.current.speaker || "unknown";
+        const lang = payload.lang || payload.language || lineLang || "unknown";
+        const norm = (text || "").trim();
+        if (!norm) return;
+
+        const buffer = currentBufferRef.current;
+        const sameSpeaker = buffer.speaker === speaker;
+        const closeInTime = ts - (buffer.ts || 0) < SILENCE_SPLIT_SECONDS;
+
+        // Merge into current card if same speaker and within silence window
+        if (buffer.text && sameSpeaker && closeInTime) {
+          let mergedText;
+          if (norm.startsWith(buffer.text)) {
+            mergedText = norm;
+          } else if (buffer.text.startsWith(norm)) {
+            mergedText = buffer.text;
+          } else {
+            mergedText = `${buffer.text} ${norm}`.trim();
+          }
+          if (mergedText === buffer.text) return;
+          const updatedEntry = {
+            text: mergedText,
+            timestamp: ts,
+            lang,
+            speaker,
+            source: "wlk",
+          };
+          currentBufferRef.current = { speaker, text: mergedText, ts };
+          setWlkTranscripts((prev) => {
+            const next = [...prev];
+            if (next.length > 0) {
+              next[0] = { ...next[0], ...updatedEntry };
+            } else {
+              next.unshift(updatedEntry);
+            }
+            return next.slice(0, 120);
+          });
+          ingestToBackend(updatedEntry, payload);
+          return;
+        }
+
+        // New card (speaker switch or silence gap)
         const entry = {
-          text,
-          timestamp: payload.timestamp || Date.now() / 1000,
-          lang: payload.lang || payload.language || lineLang || "unknown",
-          speaker: payload.speaker || payload.spk || lineSpeaker || null,
+          text: norm,
+          timestamp: ts,
+          lang,
+          speaker,
           source: "wlk",
         };
-
+        currentBufferRef.current = { speaker, text: norm, ts };
         console.log("[WLK] message", payload);
         setWlkTranscripts((prev) => [entry, ...prev].slice(0, 120));
-        ingestToBackend(entry);
+        ingestToBackend(entry, payload);
       };
 
       wlkSocket.onerror = () => setStudentStatus("WhisperLiveKit error");
@@ -147,7 +199,7 @@ export default function StudentPage() {
     }
   };
 
-  const ingestToBackend = async (entry) => {
+  const ingestToBackend = async (entry, rawPayload = null) => {
     const gid = groupId.trim();
     if (!gid) return;
     try {
@@ -160,6 +212,7 @@ export default function StudentPage() {
           speaker: entry.speaker,
           timestamp: entry.timestamp,
           source: "wlk",
+          raw_payload: rawPayload,
         }),
       });
     } catch (err) {
@@ -192,6 +245,7 @@ export default function StudentPage() {
       analysisSocketRef.current = null;
     }
 
+    currentBufferRef.current = { speaker: null, text: "", ts: 0 };
     setIsRecording(false);
     setStudentStatus("Stopped");
     setAnalysisStatus("Idle");

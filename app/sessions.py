@@ -151,6 +151,13 @@ class GroupRegistry:
             session.history = session.history[-self.max_history :]
         return session.history
 
+    def update_last(self, group_id: str, entry: dict) -> List[dict]:
+        session = self.sessions.get(group_id)
+        if not session or not session.history:
+            return []
+        session.history[-1] = entry
+        return session.history
+
     def get_history(self, group_id: str) -> List[dict]:
         session = self.sessions.get(group_id)
         if not session:

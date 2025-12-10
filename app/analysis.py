@@ -1,4 +1,5 @@
 import logging
+import re
 from collections import Counter
 from typing import Iterable, Optional, Tuple
 
@@ -51,6 +52,20 @@ def analyze_text(
             )
 
     return alerts, similarity
+
+
+def collapse_repetitions(text: str) -> str:
+    """
+    Heuristic cleanup to reduce runaway repetitions from streaming ASR.
+    - Collapse same word repeated 3+ times in a row down to 2.
+    - Collapse phrases of 3-8 words repeated back-to-back.
+    """
+    if not text:
+        return text
+
+    cleaned = re.sub(r"\b(\w+)(?:\s+\1\b){2,}", r"\1 \1", text)
+    cleaned = re.sub(r"(\b[\w'-]+(?:\s+[\w'-]+){2,7})\s+(?:\1\s*){1,}", r"\1", cleaned)
+    return cleaned.strip()
 
 
 def compute_dominance(history: Iterable[dict], window: int = 30) -> Tuple[str, Optional[str]]:

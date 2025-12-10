@@ -34,10 +34,21 @@ export default function TeacherPage() {
           speaker: data.dominance_speaker,
         };
         const existing = next[gid] || { transcripts: [] };
-        const transcripts = [entry, ...(existing.transcripts || [])].slice(0, 40);
+        const transcripts = [...(existing.transcripts || [])];
+        const last = transcripts[0];
+        const ts = data.timestamp || Date.now() / 1000;
+        const mergeWindow = 10;
+        const sameSpeaker =
+          last && last.speaker === entry.speaker && ts - (last.timestamp || 0) < mergeWindow;
+        if (sameSpeaker) {
+          transcripts[0] = { ...last, ...entry };
+        } else {
+          transcripts.unshift(entry);
+        }
+        const trimmed = transcripts.slice(0, 40);
         next[gid] = {
           last: entry,
-          transcripts,
+          transcripts: trimmed,
         };
         return next;
       });

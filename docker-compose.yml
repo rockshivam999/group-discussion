@@ -7,9 +7,17 @@ services:
       - "8000:8000"
     environment:
       - PYTHONUNBUFFERED=1
+      - WLK_HOST=localhost
+      - WLK_PORT=8100
+      - WLK_IMAGE=whisperlivekit:local
+      - WLK_SINGLETON=1
+      - WLK_MANAGED=0
+      - WLK_ARGS=--diarization --language en
     volumes:
       - ./app:/app/app
       - ./models:/app/models
+    depends_on:
+      - whisperlivekit
 
   frontend:
     build:
@@ -21,3 +29,12 @@ services:
       - "5173:80"
     depends_on:
       - backend
+
+  whisperlivekit:
+    build:
+      context: ../WhisperLiveKit
+      dockerfile: Dockerfile.cpu
+    environment:
+      - PORT=8000
+    ports:
+      - "8100:8000"

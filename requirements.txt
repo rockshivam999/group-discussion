@@ -2,10 +2,10 @@ fastapi
 uvicorn[standard]
 python-multipart
 websockets
-faster-whisper
 sentence-transformers
 scikit-learn
 better-profanity
 numpy
 scipy
 jinja2
+docker

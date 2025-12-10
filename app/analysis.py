@@ -1,16 +1,15 @@
 import logging
-from typing import Tuple
+from collections import Counter
+from typing import Iterable, Optional, Tuple
 
 from better_profanity import profanity
 from sentence_transformers import SentenceTransformer, util
-from faster_whisper import WhisperModel
 
-from .config import DEFAULT_TARGET_DESCRIPTION, DEFAULT_TARGET_TOPIC
+from .config import DEFAULT_ALLOWED_LANGUAGE
 
 logger = logging.getLogger(__name__)
 
 # Model instances are loaded once per process
-ASR_MODEL = WhisperModel("base", device="cpu", compute_type="int8")
 TOPIC_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
 profanity.load_censor_words()
 
@@ -25,16 +24,19 @@ def analyze_text(
     language: str,
     target_embedding,
     target_topic: str,
+    allowed_language: str = DEFAULT_ALLOWED_LANGUAGE,
     similarity_floor: float = 0.15,
 ):
     alerts = []
     similarity = 0.0
+    lang = (language or "").lower()
+    allowed = (allowed_language or "").lower()
 
     if profanity.contains_profanity(text):
-        alerts.append({"type": "OFFENSIVE", "msg": "Foul language detected"})
+        alerts.append({"type": "OFFENSIVE", "msg": "Foul or inappropriate language detected"})
 
-    if language and language != "en":
-        alerts.append({"type": "LANGUAGE", "msg": f"Speaking {language} instead of English"})
+    if allowed and lang and lang != allowed:
+        alerts.append({"type": "LANGUAGE", "msg": f"Speaking {lang} instead of {allowed}"})
 
     if target_topic and target_embedding is not None and text.strip():
         text_emb = TOPIC_MODEL.encode(text, convert_to_tensor=True)
@@ -51,12 +53,25 @@ def analyze_text(
     return alerts, similarity
 
 
-def compute_dominance(speech_duration: float, chunk_duration: float) -> str:
-    if chunk_duration <= 0:
-        return "QUIET"
-    ratio = speech_duration / chunk_duration
-    if ratio > 0.75:
-        return "DOMINATING"
-    if ratio > 0.35:
-        return "BALANCED"
-    return "QUIET"
+def compute_dominance(history: Iterable[dict], window: int = 30) -> Tuple[str, Optional[str]]:
+    """
+    Approximate participation balance from recent entries.
+
+    - If a single speaker holds >=70% of turns, mark DOMINATING and return that speaker.
+    - If entries exist but no dominant speaker, mark BALANCED.
+    - If little/no activity, mark QUIET.
+    """
+    recent = [h for h in history if h.get("text")][-window:]
+    if not recent:
+        return "QUIET", None
+
+    counts = Counter(entry.get("speaker") or "unknown" for entry in recent)
+    total = sum(counts.values())
+    speaker, turns = counts.most_common(1)[0]
+    ratio = turns / total if total else 0
+
+    if ratio >= 0.7:
+        return "DOMINATING", speaker
+    if ratio >= 0.3:
+        return "BALANCED", None
+    return "QUIET", None

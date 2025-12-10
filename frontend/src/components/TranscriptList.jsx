@@ -12,10 +12,14 @@ export default function TranscriptList({ transcripts }) {
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <strong>{fmtTime(entry.timestamp)}</strong>
             <span className="pill" style={{ background: "#f1f5f9" }}>{entry.lang}</span>
+            {entry.source && (
+              <span className="pill" style={{ background: "#ede9fe", color: "#5b21b6" }}>{entry.source}</span>
+            )}
           </div>
           <div className="muted" style={{ fontSize: "12px" }}>
-            Topic {entry.topic_score} · {entry.dominance} · speech {entry.speech_ratio}
+            Topic {entry.topic_score || "—"} · {entry.dominance || "—"} · speech {entry.speech_ratio ?? "—"}
             {entry.target_topic ? ` · Topic: ${entry.target_topic}` : ""}
+            {entry.speaker ? ` · Speaker: ${entry.speaker}` : ""}
           </div>
           <p style={{ margin: "6px 0" }}>{entry.text}</p>
           <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>

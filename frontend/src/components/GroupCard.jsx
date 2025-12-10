@@ -14,6 +14,9 @@ export default function GroupCard({ groupId, data, onSelect }) {
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <strong>{groupId}</strong>
         <span className="pill" style={{ background: "#f1f5f9" }}>{data.last?.lang || "??"}</span>
+        {data.last?.source && (
+          <span className="pill" style={{ background: "#ede9fe", color: "#5b21b6" }}>{data.last.source}</span>
+        )}
       </div>
       <div className="muted" style={{ fontSize: "12px" }}>
         Topic: {data.last?.target_topic || "—"}

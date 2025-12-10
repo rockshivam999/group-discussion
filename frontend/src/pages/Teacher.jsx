@@ -30,6 +30,8 @@ export default function TeacherPage() {
           silence: data.silence,
           target_topic: data.target_topic,
           target_description: data.target_description,
+          source: data.source || "analysis",
+          speaker: data.dominance_speaker,
         };
         const existing = next[gid] || { transcripts: [] };
         const transcripts = [entry, ...(existing.transcripts || [])].slice(0, 40);

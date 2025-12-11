@@ -223,14 +223,14 @@ async def process_event(group_id: str, event: IngestEvent, session) -> Dict:
         close_in_time = ts - (last.get("timestamp") or 0) < MERGE_WINDOW_SECONDS
         if same_speaker and close_in_time:
             prev_text = (last.get("text") or "").strip()
-            curr_text = (event.text or "").strip()
+            curr_text = (base_entry.get("text") or "").strip()
             if curr_text.startswith(prev_text):
                 merged_text = curr_text
             elif prev_text.startswith(curr_text):
                 merged_text = prev_text
             else:
                 merged_text = f"{prev_text} {curr_text}".strip()
-            base_entry["text"] = merged_text
+            base_entry["text"] = collapse_repetitions(merged_text)
             merged = True
             history[-1] = base_entry
 

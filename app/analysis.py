@@ -78,14 +78,35 @@ def analyze_text(
 def collapse_repetitions(text: str) -> str:
     """
     Heuristic cleanup to reduce runaway repetitions from streaming ASR.
-    - Collapse same word repeated 3+ times in a row down to 2.
-    - Collapse phrases of 3-8 words repeated back-to-back.
+    - Collapse same token repeated 3+ times in a row down to 2.
+    - Collapse short phrases (3-8 tokens) repeated back-to-back (Unicode-safe).
+    - Soft cap overly long text to keep UI/LLM stable.
     """
     if not text:
         return text
 
-    cleaned = re.sub(r"\b(\w+)(?:\s+\1\b){2,}", r"\1 \1", text)
-    cleaned = re.sub(r"(\b[\w'-]+(?:\s+[\w'-]+){2,7})\s+(?:\1\s*){1,}", r"\1", cleaned)
+    # Token-level collapse (language agnostic)
+    tokens = text.split()
+    collapsed = []
+    last = None
+    streak = 0
+    for tok in tokens:
+        if tok == last:
+            streak += 1
+        else:
+            streak = 0
+            last = tok
+        if streak < 2:  # allow at most 2 in a row
+            collapsed.append(tok)
+    cleaned = " ".join(collapsed)
+
+    # Phrase-level collapse (use \S to include non-Latin scripts)
+    cleaned = re.sub(r"\b(\w+)(?:\s+\1\b){2,}", r"\1 \1", cleaned, flags=re.UNICODE | re.IGNORECASE)
+    cleaned = re.sub(r"((?:\S+\s+){2,7}\S+)(?:\s+\1){1,}", r"\1", cleaned, flags=re.UNICODE | re.IGNORECASE)
+
+    # Soft cap length for safety
+    if len(cleaned) > 600:
+        cleaned = cleaned[:600].rstrip() + " ..."
     return cleaned.strip()
 
 

@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const defaultWsUrl = import.meta.env?.VITE_WS_URL || "ws://localhost:8100/asr";
+const backendWsUrl =
+  import.meta.env?.VITE_BACKEND_WS ||
+  (() => {
+    if (typeof window === "undefined") return "ws://localhost:8000/monitor";
+    const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+    const host = window.location.hostname || "localhost";
+    return `${protocol}://${host}:8000/monitor`;
+  })();
 
 const connectionLabel = {
   connected: "Connected",
@@ -22,11 +30,16 @@ function App() {
   const [batchAggregate, setBatchAggregate] = useState("");
   const [liveBuffer, setLiveBuffer] = useState({ diarization: "", transcription: "", translation: "" });
   const [isRecording, setIsRecording] = useState(false);
+  const [backendStatus, setBackendStatus] = useState("disconnected");
+  const [flaggedItems, setFlaggedItems] = useState([]);
   const socketRef = useRef(null);
+  const backendSocketRef = useRef(null);
+  const backendReconnectRef = useRef(null);
   const fullTextRef = useRef("");
   const lastPhraseRef = useRef("");
   const chunkWindowRef = useRef([]);
   const historyRef = useRef("");
+  const conversationRef = useRef([]);
   const mediaStreamRef = useRef(null);
   const recorderRef = useRef(null);
 
@@ -41,7 +54,17 @@ function App() {
       .join("\n");
   }, [conversation]);
 
-  const updateLatestChunk = useCallback((historyText) => {
+  const sendDeltaToBackend = useCallback((payload) => {
+    const socket = backendSocketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    try {
+      socket.send(JSON.stringify(payload));
+    } catch (err) {
+      console.warn("Could not send delta to backend", err);
+    }
+  }, []);
+
+  const updateLatestChunk = useCallback((historyText, lastLineMeta = null) => {
     const previous = fullTextRef.current || "";
     const trimmed = historyText.trim();
 
@@ -59,6 +82,16 @@ function App() {
     if (!delta) return;
 
     console.log("Latest transcript addition:", delta);
+    if (lastLineMeta) {
+      sendDeltaToBackend({
+        type: "delta",
+        text: delta,
+        speaker: lastLineMeta.speaker ?? null,
+        start: lastLineMeta.start,
+        end: lastLineMeta.end,
+        timestamp: lastLineMeta.timestamp || new Date().toISOString()
+      });
+    }
 
     setChunkTotal((count) => count + 1);
     setChunkWindow((prev) => {
@@ -75,6 +108,27 @@ function App() {
 
       return next;
     });
+  }, []);
+
+  const sendSnapshotToBackend = useCallback(() => {
+    const socket = backendSocketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+
+    const snapshot = (conversationRef.current || []).map((line) => ({
+      speaker: line.speaker,
+      text: line.text,
+      start: line.start,
+      end: line.end,
+      detected_language: line.detected_language,
+      translation: line.translation,
+      timestamp: line.timestamp || new Date().toISOString(),
+    }));
+
+    try {
+      socket.send(JSON.stringify({ type: "snapshot", items: snapshot }));
+    } catch (err) {
+      console.warn("Could not send snapshot to backend", err);
+    }
   }, []);
 
   const stopRecording = useCallback(() => {
@@ -206,23 +260,26 @@ function App() {
           })
           .join(" | ");
 
-        const latestStableText = (() => {
+        const latestStableMeta = (() => {
           for (let i = effectiveLines.length - 1; i >= 0; i--) {
-            const t = (effectiveLines[i].text || "").trim();
-            const speaker = effectiveLines[i].speaker;
+            const line = effectiveLines[i];
+            const t = (line.text || "").trim();
             if (!t) continue;
-            if (speaker === 0 || speaker === -2) continue; // skip loading/silence
-            return t;
+            if (line.speaker === 0 || line.speaker === -2) continue; // skip loading/silence
+            return line;
           }
-          return "";
+          return null;
         })();
 
-        if (latestStableText && latestStableText !== lastPhraseRef.current) {
-          lastPhraseRef.current = latestStableText;
-          setLastPhrase(latestStableText);
+        if (latestStableMeta) {
+          const latestStableText = (latestStableMeta.text || "").trim();
+          if (latestStableText && latestStableText !== lastPhraseRef.current) {
+            lastPhraseRef.current = latestStableText;
+            setLastPhrase(latestStableText);
+          }
         }
 
-        updateLatestChunk(historyText);
+        updateLatestChunk(historyText, effectiveLines[effectiveLines.length - 1]);
       } catch (err) {
         console.error("Could not parse websocket payload", err);
       }
@@ -279,6 +336,53 @@ function App() {
     }
   }, [connectionStatus, handleMessage, startRecording, stopRecording, wsUrl]);
 
+  const connectBackend = useCallback(() => {
+    if (backendSocketRef.current && backendSocketRef.current.readyState === WebSocket.OPEN) return;
+
+    try {
+      const socket = new WebSocket(backendWsUrl);
+      backendSocketRef.current = socket;
+      setBackendStatus("connecting");
+
+      socket.onopen = () => {
+        setBackendStatus("connected");
+        sendSnapshotToBackend();
+      };
+
+      socket.onerror = (err) => {
+        console.warn("Backend websocket error", err);
+        setBackendStatus("error");
+      };
+
+      socket.onclose = () => {
+        setBackendStatus("disconnected");
+        backendSocketRef.current = null;
+        if (backendReconnectRef.current) clearTimeout(backendReconnectRef.current);
+        backendReconnectRef.current = setTimeout(connectBackend, 3000);
+      };
+
+      socket.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data);
+          if (payload.type === "flagged" && payload.payload) {
+            setFlaggedItems((prev) => [...prev, payload.payload]);
+          }
+          if (payload.type === "flagged_bulk" && Array.isArray(payload.items)) {
+            setFlaggedItems(payload.items);
+          }
+          if (payload.type === "history" && payload.history) {
+            console.log("Backend history snapshot:", payload.history);
+          }
+        } catch (err) {
+          console.warn("Could not parse backend message", err);
+        }
+      };
+    } catch (err) {
+      console.warn("Could not open backend websocket", err);
+      setBackendStatus("error");
+    }
+  }, [backendWsUrl, sendSnapshotToBackend]);
+
   const disconnect = useCallback(() => {
     if (socketRef.current) {
       socketRef.current.close();
@@ -305,8 +409,33 @@ function App() {
         socketRef.current.close();
       }
       stopRecording();
+      if (backendSocketRef.current) {
+        backendSocketRef.current.close();
+      }
+      if (backendReconnectRef.current) {
+        clearTimeout(backendReconnectRef.current);
+      }
     };
   }, [stopRecording]);
+
+  useEffect(() => {
+    conversationRef.current = conversation;
+  }, [conversation]);
+
+  useEffect(() => {
+    connectBackend();
+    return () => {
+      if (backendSocketRef.current) backendSocketRef.current.close();
+      if (backendReconnectRef.current) clearTimeout(backendReconnectRef.current);
+    };
+  }, [connectBackend]);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      sendSnapshotToBackend();
+    }, 30000);
+    return () => clearInterval(interval);
+  }, [sendSnapshotToBackend]);
 
   const resetCounters = () => {
     setLastPhrase("");
@@ -365,13 +494,14 @@ function App() {
       <div className="grid">
         <section className="panel transcript">
           <div className="badge-row">
-            <span className="status-chip">
-              <span className="status-dot connected" />
-              {serverState}
-            </span>
-            {serverMode && <span className="pill muted">{serverMode}</span>}
-            {lastPhrase && <span className="pill">Last phrase: {lastPhrase}</span>}
-          </div>
+          <span className="status-chip">
+            <span className="status-dot connected" />
+            {serverState}
+          </span>
+          {serverMode && <span className="pill muted">{serverMode}</span>}
+          <span className="pill muted">Backend WS: {backendStatus}</span>
+          {lastPhrase && <span className="pill">Last phrase: {lastPhrase}</span>}
+        </div>
 
           <div className="scrollable">
             {conversation.length === 0 && <p className="muted">Waiting for live transcription…</p>}
@@ -436,6 +566,22 @@ function App() {
             Transcription: {liveBuffer.transcription || "—"}
             <br />
             Translation: {liveBuffer.translation || "—"}
+          </div>
+
+          <div className="live-note">
+            <strong>Flagged language ({flaggedItems.length})</strong>
+            {flaggedItems.length === 0 ? (
+              <div>No issues flagged yet.</div>
+            ) : (
+              <ul style={{ margin: "6px 0 0", paddingLeft: "18px" }}>
+                {flaggedItems.slice(-5).map((item, idx) => (
+                  <li key={`${item.timestamp || idx}-${idx}`}>
+                    Speaker {item.speaker ?? "?"}: {item.text}{" "}
+                    {item.flagged_words ? `(bad: ${item.flagged_words.join(", ")})` : ""}
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
         </section>
       </div>

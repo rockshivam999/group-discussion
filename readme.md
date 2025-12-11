@@ -19,7 +19,11 @@ RUN apt-get update && \
 
 # Install CPU-only PyTorch
 RUN pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
-
+# Install dependencies
+RUN pip install --no-cache-dir \
+      whisperlivekit[diarization] \
+      pyannote.audio \
+      speechbrain
 COPY . .
 
 # Install WhisperLiveKit directly, allowing for optional dependencies
@@ -55,7 +59,12 @@ RUN if [ -n "$HF_TKN_FILE" ]; then \
 # Expose port for the transcription server
 EXPOSE 8000
 
-ENTRYPOINT ["whisperlivekit-server", "--host", "0.0.0.0", "--diarization"]
+# ENTRYPOINT ["whisperlivekit-server", "--host", "0.0.0.0", "--diarization"]
 
-# Default args - you might want to use a smaller model for CPU
-CMD ["--model", "base", "--language", "en", "--diarization"]
+# # Default args - you might want to use a smaller model for CPU
+# CMD ["--model", "base", "--language", "en", "--diarization"]
+
+ENTRYPOINT ["whisperlivekit-server", "--host", "0.0.0.0", "--diarization"]
+CMD ["--model", "base", "--language", "en", \
+     "--segmentation-model", "pyannote/segmentation-3.0", \
+     "--embedding-model", "speechbrain/spkrec-ecapa-voxceleb"]

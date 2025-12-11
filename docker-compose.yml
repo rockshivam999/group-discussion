@@ -7,8 +7,8 @@ services:
       - "8000:8000"
     environment:
       - PYTHONUNBUFFERED=1
-      - WLK_HOST=localhost
-      - WLK_PORT=8100
+      - WLK_HOST=whisperlivekit
+      - WLK_PORT=8000
       - WLK_IMAGE=whisperlivekit:local
       - WLK_SINGLETON=1
       - WLK_MANAGED=0
@@ -24,7 +24,7 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        - VITE_BACKEND_HOST=backend
+        - VITE_WS_URL=ws://localhost:8100/asr
     ports:
       - "5173:80"
     depends_on:

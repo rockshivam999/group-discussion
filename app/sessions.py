@@ -33,6 +33,8 @@ class GroupSession:
     last_lang_word_idx: int = 0
     last_profanity_word_idx: int = 0
     total_word_count: int = 0
+    lang_word_buffer: int = 0
+    last_text_by_speaker: Dict[str, str] = field(default_factory=dict)
 
 
 class GroupRegistry:
@@ -83,6 +85,8 @@ class GroupRegistry:
             session.last_lang_word_idx = 0
             session.last_profanity_word_idx = 0
             session.total_word_count = 0
+            session.lang_word_buffer = 0
+            session.last_text_by_speaker = {}
             return session
 
         container_id, ws_url = self._ensure_wlk_endpoint(group_id)

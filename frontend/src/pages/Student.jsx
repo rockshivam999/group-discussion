@@ -84,12 +84,18 @@ export default function StudentPage() {
       analysisSocket.onerror = () => setAnalysisStatus("Error");
       analysisSocket.onmessage = (event) => {
         const data = JSON.parse(event.data);
+        const alerts = data.alerts || [];
+        const hasFlag =
+          alerts.length > 0 ||
+          data.dominance_state === "DOMINATING" ||
+          data.dominance_state === "QUIET";
+        if (!hasFlag) return;
         const entry = {
           text: data.text,
           timestamp: data.timestamp,
           lang: data.lang,
           topic_score: data.topic_score,
-          alerts: data.alerts || [],
+          alerts,
           dominance: data.dominance_state,
           speech_ratio: data.speech_ratio,
           silence: data.silence,

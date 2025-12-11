@@ -17,32 +17,35 @@ export default function TeacherPage() {
       if (!data.group_id) return;
       const gid = data.group_id;
 
+      const entry = {
+        text: data.text,
+        lang: data.lang,
+        timestamp: data.timestamp,
+        topic_score: data.topic_score,
+        alerts: data.alerts || [],
+        dominance: data.dominance_state,
+        speech_ratio: data.speech_ratio,
+        silence: data.silence,
+        target_topic: data.target_topic,
+        target_description: data.target_description,
+        source: data.source || "analysis",
+        speaker: data.dominance_speaker,
+      };
+
+      const hasFlag =
+        (entry.alerts && entry.alerts.length > 0) ||
+        entry.dominance === "DOMINATING" ||
+        entry.dominance === "QUIET";
+
+      if (!hasFlag) return;
+
       setGroups((prev) => {
         const next = { ...prev };
-        const entry = {
-          text: data.text,
-          lang: data.lang,
-          timestamp: data.timestamp,
-          topic_score: data.topic_score,
-          alerts: data.alerts || [],
-          dominance: data.dominance_state,
-          speech_ratio: data.speech_ratio,
-          silence: data.silence,
-          target_topic: data.target_topic,
-          target_description: data.target_description,
-          source: data.source || "analysis",
-          speaker: data.dominance_speaker,
-        };
         const existing = next[gid] || { transcripts: [] };
-        const transcripts = [...(existing.transcripts || [])];
-        if (data.alerts && data.alerts.length > 0) {
-          // Only add card when alerts present
-          transcripts.unshift(entry);
-        }
-        const trimmed = transcripts.slice(0, 40);
+        const transcripts = [{ ...entry }, ...(existing.transcripts || [])].slice(0, 40);
         next[gid] = {
           last: entry,
-          transcripts: trimmed,
+          transcripts,
         };
         return next;
       });

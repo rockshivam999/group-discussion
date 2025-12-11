@@ -177,32 +177,39 @@ async def process_event(group_id: str, event: IngestEvent, session) -> Dict:
     words = (base_entry["text"] or "").split()
     alerts = []
 
-    # Always run profanity on the new text chunk
-    alerts.extend(
-        analyze_live_alerts(
-            text=base_entry["text"],
-            language=lang,
-            allowed_language=session.allowed_language,
-            check_language=False,
-        )
-    )
+    prev_text = session.last_text_by_speaker.get(speaker, "")
+    if base_entry["text"].startswith(prev_text):
+        new_segment = base_entry["text"][len(prev_text):].strip()
+    else:
+        new_segment = base_entry["text"]
 
-    # Update cumulative word counts for language checks
-    session.total_word_count += len(words)
-    total_words = session.total_word_count
+    new_words_count = len(new_segment.split())
 
-    # Language check every +10 new words (cumulative)
-    new_lang_words = total_words - session.last_lang_word_idx
-    if new_lang_words >= 10:
+    # Profanity on new segment only
+    if new_segment:
         alerts.extend(
             analyze_live_alerts(
-                text=" ".join(words),
+                text=new_segment,
+                language=lang,
+                allowed_language=session.allowed_language,
+                check_language=False,
+            )
+        )
+
+    # Language check every +10 new words (buffered)
+    session.lang_word_buffer += new_words_count
+    if session.lang_word_buffer >= 10:
+        alerts.extend(
+            analyze_live_alerts(
+                text=new_segment or base_entry["text"],
                 language=lang,
                 allowed_language=session.allowed_language,
                 check_language=True,
             )
         )
-        session.last_lang_word_idx = total_words
+        session.lang_word_buffer = 0
+
+    session.last_text_by_speaker[speaker] = base_entry["text"]
     logger.info("Raw transcript event for %s (speaker=%s): %s", group_id, speaker, event.text)
 
     history = registry.get_history(group_id)

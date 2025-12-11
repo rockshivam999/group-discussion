@@ -186,9 +186,19 @@ function App() {
           };
         });
 
-        setConversation(merged);
+        const effectiveLines = merged.filter((l) => {
+          const main = (l.text || "").trim();
+          const translation = (l.translation || "").trim();
+          return main.length > 0 || translation.length > 0;
+        });
 
-        const historyText = merged
+        if (effectiveLines.length === 0) {
+          return;
+        }
+
+        setConversation(effectiveLines);
+
+        const historyText = effectiveLines
           .map((l) => {
             const speaker = l.speaker !== undefined ? l.speaker : "?";
             const translation = l.translation ? ` [${l.translation}]` : "";
@@ -197,9 +207,9 @@ function App() {
           .join(" | ");
 
         const latestStableText = (() => {
-          for (let i = merged.length - 1; i >= 0; i--) {
-            const t = (merged[i].text || "").trim();
-            const speaker = merged[i].speaker;
+          for (let i = effectiveLines.length - 1; i >= 0; i--) {
+            const t = (effectiveLines[i].text || "").trim();
+            const speaker = effectiveLines[i].speaker;
             if (!t) continue;
             if (speaker === 0 || speaker === -2) continue; // skip loading/silence
             return t;

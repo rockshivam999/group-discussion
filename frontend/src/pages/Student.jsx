@@ -12,6 +12,7 @@ const LANG_OPTIONS = [
 
 const WORD_THRESHOLD = 10;
 const SILENCE_SPLIT_SECONDS = 10;
+const DEDUPE_WINDOW_SECONDS = 8;
 
 export default function StudentPage() {
   const [groupId, setGroupId] = useState("Group-Alpha");
@@ -28,7 +29,13 @@ export default function StudentPage() {
   const [flags, setFlags] = useState([]);
   const [analysisTranscripts, setAnalysisTranscripts] = useState([]);
   const speakerBuffersRef = useRef({});
+  const recentTextRef = useRef({});
+  const lastFrameSignatureRef = useRef(null);
   const lastSentRef = useRef({});
+  const lastSignatureRef = useRef({});
+  const lastEndRef = useRef({});
+  const lastFullTextRef = useRef({});
+  const sentEventsRef = useRef({});
   const navigate = useNavigate();
 
   const cleanText = (t) => {
@@ -84,12 +91,13 @@ export default function StudentPage() {
       analysisSocket.onerror = () => setAnalysisStatus("Error");
       analysisSocket.onmessage = (event) => {
         const data = JSON.parse(event.data);
+        const entryAlerts = data.alerts || [];
         const entry = {
           text: data.text,
           timestamp: data.timestamp,
           lang: data.lang,
           topic_score: data.topic_score,
-          alerts,
+          alerts: entryAlerts,
           dominance: data.dominance_state,
           speech_ratio: data.speech_ratio,
           silence: data.silence,
@@ -98,7 +106,7 @@ export default function StudentPage() {
           speaker: data.dominance_speaker || data.speaker,
         };
         setAnalysisTranscripts((prev) => [entry, ...prev].slice(0, 200));
-        if ((data.alerts || []).length > 0 || data.source === "llm") {
+        if (entryAlerts.length > 0 || data.source === "llm") {
           setFlags((prev) => [entry, ...prev].slice(0, 120));
         }
       };
@@ -106,9 +114,11 @@ export default function StudentPage() {
       const wlkSocket = new WebSocket(session.wlk_ws_url);
       wlkSocketRef.current = wlkSocket;
       setStudentStatus("Connecting to WhisperLiveKit...");
+      lastFrameSignatureRef.current = null;
 
       wlkSocket.onopen = async () => {
         setStudentStatus("Streaming to WhisperLiveKit...");
+        sentEventsRef.current = {};
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         const preferredMime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
           ? "audio/webm;codecs=opus"
@@ -138,40 +148,133 @@ export default function StudentPage() {
           payload = { text: event.data };
         }
 
-        const lines = (payload.lines || []).filter((l) => l.text && l.text.trim());
-        if (lines.length === 0) return;
+        // Drop frames that are byte-for-byte identical to the previous one (matches WLK sample UI behavior)
+        const frameSignature = JSON.stringify(
+          (payload.lines || []).map((l) => ({
+            s: l.speaker,
+            t: l.text,
+            st: l.start,
+            e: l.end,
+            lang: l.detected_language || payload.lang || payload.language,
+          }))
+        );
+        if (lastFrameSignatureRef.current === frameSignature) {
+          return;
+        }
+        lastFrameSignatureRef.current = frameSignature;
 
-        const mapped = lines.map((l) => ({
-          text: cleanText(l.text || ""),
-          speaker: l.speaker ?? "unknown",
-          lang: l.detected_language || payload.lang || payload.language || "unknown",
-          timestamp: Date.now() / 1000,
+        // Use only the most recent non-empty, non-silence line by end time
+        const candidates = (payload.lines || []).filter((l) => l.text && l.text.trim() && l.speaker !== -2);
+        if (candidates.length === 0) return;
+
+        const parseEndToSeconds = (endStr) => {
+          if (!endStr || typeof endStr !== "string") return null;
+          const parts = endStr.split(":").map(Number);
+          if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+          if (parts.length === 2) return parts[0] * 60 + parts[1];
+          return null;
+        };
+
+        const latest = candidates.reduce((acc, cur) => {
+          const accEnd = parseEndToSeconds(acc?.end) || 0;
+          const curEnd = parseEndToSeconds(cur?.end) || 0;
+          return curEnd > accEnd ? cur : acc;
+        }, candidates[0]);
+
+        const endSeconds = parseEndToSeconds(latest.end);
+
+        const entry = {
+          text: cleanText(latest.text || ""),
+          speaker: latest.speaker ?? "unknown",
+          lang: latest.detected_language || payload.lang || payload.language || "unknown",
+          timestamp: endSeconds || Date.now() / 1000,
           source: "wlk",
-        }));
-        setWlkTranscripts((prev) => [...mapped.reverse(), ...prev].slice(0, 200));
+        };
+
+        // Skip if this line end timestamp has not advanced enough (avoid replays after silence)
+        const lastEnd = lastEndRef.current[entry.speaker] || 0;
+        const silenceGap = endSeconds && lastEnd && endSeconds - lastEnd > SILENCE_SPLIT_SECONDS;
+        if (endSeconds && endSeconds <= lastEnd + 0.25) {
+            return;
+        }
+        if (endSeconds) {
+            lastEndRef.current[entry.speaker] = endSeconds;
+        }
+
+        const key = `${entry.speaker}|${entry.lang}`;
+        const signature = `${key}|${entry.text}`;
+        const lastSig = lastSignatureRef.current[key];
+        if (lastSig && lastSig.signature === signature && entry.timestamp - lastSig.ts < 3) {
+          return; // drop exact replays within cooldown
+        }
+        lastSignatureRef.current[key] = { signature, ts: entry.timestamp };
+
+        setWlkTranscripts((prev) => [entry, ...prev].slice(0, 200));
+
+        // Drop loops where WLK replays the same text variants for the same speaker in quick succession
+        const recent = recentTextRef.current[entry.speaker] || [];
+        const now = entry.timestamp;
+        const fresh = recent.filter((r) => now - r.ts < DEDUPE_WINDOW_SECONDS);
+        const seenRecently = fresh.some((r) => r.text === entry.text);
+        if (seenRecently) {
+          recentTextRef.current[entry.speaker] = fresh;
+          lastFullTextRef.current[entry.speaker] = entry.text;
+          return;
+        }
+        fresh.push({ text: entry.text, ts: now });
+        recentTextRef.current[entry.speaker] = fresh.slice(-5);
+
+        // Compute only the newly added segment for this speaker (front-end diff)
+        const prevFull = lastFullTextRef.current[entry.speaker] || "";
+        const isExtension = !!prevFull && entry.text.startsWith(prevFull);
+        const newSegment = isExtension ? entry.text.slice(prevFull.length).trim() : entry.text;
+        const words = newSegment.split(/\s+/).filter(Boolean);
+        if (words.length === 0) {
+          lastFullTextRef.current[entry.speaker] = entry.text;
+          return;
+        }
+
+        // After a long silence, treat the next chunk as baseline without sending to backend
+        if (silenceGap) {
+          speakerBuffersRef.current[entry.speaker] = { wordCount: words.length, ts: entry.timestamp, text: entry.text };
+          lastFullTextRef.current[entry.speaker] = entry.text;
+          recentTextRef.current[entry.speaker] = [{ text: entry.text, ts: entry.timestamp }];
+          lastSignatureRef.current[key] = { signature, ts: entry.timestamp };
+          return;
+        }
+
+        // Never resend text with a timestamp that is not advancing for this speaker
+        const lastSent = lastSentRef.current[entry.speaker];
+        if (lastSent && entry.timestamp <= lastSent.ts) {
+          speakerBuffersRef.current[entry.speaker] = { wordCount: words.length, ts: entry.timestamp, text: entry.text };
+          lastFullTextRef.current[entry.speaker] = entry.text;
+          recentTextRef.current[entry.speaker] = fresh.slice(-5);
+          return;
+        }
 
         const buffers = speakerBuffersRef.current;
-        mapped.forEach((entry) => {
-          const words = entry.text.split(/\s+/).filter(Boolean);
-          const wordCount = words.length;
-          const buf = buffers[entry.speaker] || { wordCount: 0, ts: 0, text: "" };
-          const newWords = Math.max(0, wordCount - buf.wordCount);
-          const timeGap = entry.timestamp - (buf.ts || 0);
-          const lastSent = lastSentRef.current[entry.speaker] || { len: 0, ts: 0 };
-          const charGrowth = entry.text.length - (lastSent.len || 0);
+        const buf = buffers[entry.speaker] || { wordCount: 0, ts: 0, text: "" };
+        const wordCount = (buf.wordCount || 0) + words.length;
+        const timeGap = entry.timestamp - (buf.ts || 0);
+        const charGrowth = newSegment.length;
 
-          const shouldSend =
-            !buf.text ||
-            newWords >= WORD_THRESHOLD ||
-            timeGap > SILENCE_SPLIT_SECONDS ||
-            charGrowth >= 20;
+        const shouldSend =
+          !buf.text ||
+          timeGap > SILENCE_SPLIT_SECONDS ||
+          (isExtension && (words.length >= WORD_THRESHOLD || charGrowth >= 15));
 
-          if (shouldSend) {
-            ingestToBackend(entry, payload);
-            buffers[entry.speaker] = { wordCount, ts: entry.timestamp, text: entry.text };
-            lastSentRef.current[entry.speaker] = { len: entry.text.length, ts: entry.timestamp };
-          }
-        });
+        if (shouldSend) {
+          ingestToBackend({
+            text: newSegment,
+            lang: entry.lang,
+            speaker: entry.speaker,
+            timestamp: entry.timestamp,
+            source: entry.source,
+          });
+          lastSentRef.current[entry.speaker] = { len: newSegment.length, ts: entry.timestamp };
+        }
+        buffers[entry.speaker] = { wordCount, ts: entry.timestamp, text: entry.text };
+        lastFullTextRef.current[entry.speaker] = entry.text;
       };
 
       wlkSocket.onerror = () => setStudentStatus("WhisperLiveKit error");
@@ -185,6 +288,15 @@ export default function StudentPage() {
   const ingestToBackend = async (entry, rawPayload = null) => {
     const gid = groupId.trim();
     if (!gid) return;
+
+    // Drop repeats for the same speaker/lang/text within a short window to avoid backend floods on replayed frames
+    const dedupeKey = `${entry.speaker}|${entry.lang}|${entry.text}|${Math.round(entry.timestamp || 0)}`;
+    const lastSeen = sentEventsRef.current[dedupeKey];
+    if (lastSeen && entry.timestamp && entry.timestamp - lastSeen < 30) {
+      return;
+    }
+    sentEventsRef.current[dedupeKey] = entry.timestamp || Date.now() / 1000;
+
     try {
       await fetch(`${apiBase}/groups/${encodeURIComponent(gid)}/events`, {
         method: "POST",
@@ -229,6 +341,8 @@ export default function StudentPage() {
     }
 
     speakerBuffersRef.current = {};
+    lastFrameSignatureRef.current = null;
+    sentEventsRef.current = {};
     setIsRecording(false);
     setStudentStatus("Stopped");
     setAnalysisStatus("Idle");

@@ -39,7 +39,10 @@ class GroupSession:
     history: List[dict] = field(default_factory=list)
     last_summary_at: float = 0.0
     last_text_by_speaker: Dict[str, str] = field(default_factory=dict)
+    last_digest_by_speaker: Dict[str, tuple] = field(default_factory=dict)
     lang_word_buffer_by_speaker: Dict[str, int] = field(default_factory=dict)
+    last_lang_len_by_speaker: Dict[str, int] = field(default_factory=dict)
+    last_profanity_len_by_speaker: Dict[str, int] = field(default_factory=dict)
 
 
 class GroupRegistry:
@@ -78,7 +81,10 @@ class GroupRegistry:
                 cid, url = self._ensure_wlk_endpoint(group_id)
                 session.wlk_container_id = cid
                 session.wlk_ws_url = url
+            # Reset per-speaker state for a clean restart
             session.last_text_by_speaker = {}
+            session.last_lang_len_by_speaker = {}
+            session.last_profanity_len_by_speaker = {}
             session.lang_word_buffer_by_speaker = {}
             return session
 
@@ -91,6 +97,8 @@ class GroupRegistry:
             target_embedding=embedding,
             wlk_container_id=container_id,
             wlk_ws_url=ws_url,
+            last_lang_len_by_speaker={},
+            last_profanity_len_by_speaker={},
         )
         self.sessions[group_id] = session
         return session

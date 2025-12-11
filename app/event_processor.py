@@ -29,6 +29,10 @@ class EventProcessor:
         speaker = str(speaker_val) if speaker_val is not None else "unknown"
         lang = payload.lang or "unknown"
 
+        # Per-speaker short-circuit: drop identical text+lang seen very recently to prevent floods after silence
+        dedupe_key = f"{speaker}|{lang}"
+        last_digest = session.last_text_by_speaker.get(dedupe_key)
+
         base_entry: Dict = {
             "group_id": group_id,
             "source": payload.source or "wlk",
@@ -43,18 +47,41 @@ class EventProcessor:
 
         alerts = []
         prev_text = session.last_text_by_speaker.get(speaker, "")
-        new_segment = diff_new_segment(prev_text, base_entry["text"])
-        new_words_count = len(new_segment.split()) if new_segment else 0
+        words = base_entry["text"].split()
+        total_words = len(words)
 
-        if new_segment:
-            alerts.extend(profanity_alerts(new_segment, speaker, lang, max_len=PROFANITY_SNIPPET_LENGTH))
+        # Profanity: check only newly added words since last profanity scan for this speaker
+        prev_prof_idx = session.last_profanity_len_by_speaker.get(speaker, 0)
+        if total_words > prev_prof_idx:
+            prof_segment = " ".join(words[prev_prof_idx:])
+            alerts.extend(profanity_alerts(prof_segment, speaker, lang, max_len=PROFANITY_SNIPPET_LENGTH))
+            session.last_profanity_len_by_speaker[speaker] = total_words
 
-        if new_words_count > 0:
-            buf = session.lang_word_buffer_by_speaker.get(speaker, 0) + new_words_count
+        # Language: accumulate newly added words since last language scan
+        prev_lang_len = session.last_lang_len_by_speaker.get(speaker, 0)
+        new_lang_words = max(0, total_words - prev_lang_len)
+        new_words_count = new_lang_words
+        if new_lang_words > 0:
+            session.last_lang_len_by_speaker[speaker] = total_words
+            buf = session.lang_word_buffer_by_speaker.get(speaker, 0) + new_lang_words
             while buf >= self.language_word_threshold:
-                alerts.extend(language_alerts(new_segment or base_entry["text"], lang, session.allowed_language))
+                lang_segment = " ".join(words[-self.language_word_threshold :]) if words else base_entry["text"]
+                alerts.extend(language_alerts(lang_segment, lang, session.allowed_language))
                 buf -= self.language_word_threshold
             session.lang_word_buffer_by_speaker[speaker] = buf
+
+        # Use the new_lang_words as the growth metric for merge guards
+
+        # Early guard: drop exact same text for same speaker/lang and dedupe within 1 second
+        digest = (base_entry["text"], base_entry["lang"])
+        last_digest = session.last_digest_by_speaker.get(speaker)
+        if last_digest:
+            last_text, last_lang, last_ts = last_digest
+            if last_text == digest[0] and last_lang == digest[1] and (ts - last_ts) < 3.0:
+                history = self.registry.get_history(group_id)
+                return history[-1] if history else base_entry
+
+        session.last_digest_by_speaker[speaker] = (digest[0], digest[1], ts)
 
         session.last_text_by_speaker[speaker] = base_entry["text"]
 
@@ -72,7 +99,7 @@ class EventProcessor:
                 return last
             same_speaker = (last.get("speaker") or "unknown") == speaker
             close_in_time = ts - (last.get("timestamp") or 0) < MERGE_WINDOW_SECONDS
-            small_change = new_words_count < 3 and len(base_entry["text"]) <= len(last.get("text") or "")
+            small_change = new_words_count < 3 and (len(base_entry["text"]) - len(last.get("text") or "")) < 4
             if (
                 same_speaker
                 and close_in_time

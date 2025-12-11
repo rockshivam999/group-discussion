@@ -1,1 +1,14 @@
-__pycache__
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/
+.venv/
+node_modules/
+dist/
+.DS_Store
+*.log
+*.sqlite

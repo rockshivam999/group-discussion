@@ -10,10 +10,13 @@ const LANG_OPTIONS = [
   { code: "hi", label: "Hindi" },
 ];
 
+const WORD_THRESHOLD = 10;
+const SILENCE_SPLIT_SECONDS = 10;
+
 export default function StudentPage() {
   const [groupId, setGroupId] = useState("Group-Alpha");
   const [topic, setTopic] = useState("Nature");
-  const [description, setDescription] = useState("Discuss biodiversity, forests, oceans, and why protecting nature matters.");
+  const [description, setDescription] = useState("Discuss biodiversity and why protecting nature matters.");
   const [allowedLanguage, setAllowedLanguage] = useState("en");
   const [isRecording, setIsRecording] = useState(false);
   const [studentStatus, setStudentStatus] = useState("Idle");
@@ -22,29 +25,17 @@ export default function StudentPage() {
   const wlkSocketRef = useRef(null);
   const analysisSocketRef = useRef(null);
   const [wlkTranscripts, setWlkTranscripts] = useState([]);
+  const [flags, setFlags] = useState([]);
   const [analysisTranscripts, setAnalysisTranscripts] = useState([]);
-  const currentBufferRef = useRef({ speaker: null, text: "", ts: 0, count: 0 });
   const speakerBuffersRef = useRef({});
+  const lastSentRef = useRef({});
   const navigate = useNavigate();
-  const SILENCE_SPLIT_SECONDS = 10;
 
   const cleanText = (t) => {
     if (!t) return "";
     let cleaned = t.replace(/\b(\w+)(?:\s+\1\b){2,}/gi, "$1 $1");
     cleaned = cleaned.replace(/(\b[\w'-]+(?:\s+[\w'-]+){2,7})\s+(?:\1\s*){1,}/gi, "$1");
     return cleaned.trim();
-  };
-
-  const tsFromTimeString = (t) => {
-    if (!t || typeof t !== "string") return null;
-    const parts = t.split(":").map(Number);
-    if (parts.length === 3) {
-      return parts[0] * 3600 + parts[1] * 60 + parts[2];
-    }
-    if (parts.length === 2) {
-      return parts[0] * 60 + parts[1];
-    }
-    return null;
   };
 
   const startRecording = async () => {
@@ -66,8 +57,7 @@ export default function StudentPage() {
         }),
       });
       if (!res.ok) {
-        const msg = await res.text();
-        setStudentStatus(`Session error: ${msg}`);
+        setStudentStatus(`Session error: ${await res.text()}`);
         return;
       }
       const session = await res.json();
@@ -76,7 +66,17 @@ export default function StudentPage() {
         return;
       }
 
-      // Connect to analysis stream (backend fan-out)
+      // Prefill with existing history so previous runs are visible
+      fetch(`${apiBase}/groups/${encodeURIComponent(gid)}/history`)
+        .then((res) => res.json())
+        .then((json) => {
+          const hist = (json.history || []).slice().reverse();
+          setAnalysisTranscripts(hist.map((h) => ({ ...h, speaker: h.speaker || h.dominance_speaker })));
+          const flagged = hist.filter((h) => (h.alerts || []).length > 0 || h.source === "llm");
+          setFlags(flagged);
+        })
+        .catch((err) => console.error("history fetch failed", err));
+
       const analysisSocket = new WebSocket(`${wsBase}/ws/group/${encodeURIComponent(gid)}`);
       analysisSocketRef.current = analysisSocket;
       analysisSocket.onopen = () => setAnalysisStatus("Connected");
@@ -84,12 +84,6 @@ export default function StudentPage() {
       analysisSocket.onerror = () => setAnalysisStatus("Error");
       analysisSocket.onmessage = (event) => {
         const data = JSON.parse(event.data);
-        const alerts = data.alerts || [];
-        const hasFlag =
-          alerts.length > 0 ||
-          data.dominance_state === "DOMINATING" ||
-          data.dominance_state === "QUIET";
-        if (!hasFlag) return;
         const entry = {
           text: data.text,
           timestamp: data.timestamp,
@@ -101,12 +95,14 @@ export default function StudentPage() {
           silence: data.silence,
           target_topic: data.target_topic,
           source: data.source || "analysis",
-          speaker: data.dominance_speaker,
+          speaker: data.dominance_speaker || data.speaker,
         };
-        setAnalysisTranscripts((prev) => [entry, ...prev].slice(0, 120));
+        setAnalysisTranscripts((prev) => [entry, ...prev].slice(0, 200));
+        if ((data.alerts || []).length > 0 || data.source === "llm") {
+          setFlags((prev) => [entry, ...prev].slice(0, 120));
+        }
       };
 
-      // Connect to WhisperLiveKit for audio streaming
       const wlkSocket = new WebSocket(session.wlk_ws_url);
       wlkSocketRef.current = wlkSocket;
       setStudentStatus("Connecting to WhisperLiveKit...");
@@ -122,7 +118,6 @@ export default function StudentPage() {
 
         recorder.ondataavailable = (event) => {
           if (event.data.size > 0 && wlkSocket.readyState === WebSocket.OPEN) {
-            // send blob directly; WLK uses ffmpeg to decode
             wlkSocket.send(event.data);
           }
         };
@@ -142,47 +137,41 @@ export default function StudentPage() {
         } catch (_) {
           payload = { text: event.data };
         }
-        console.log(payload);
-        // Prefer finalized lines; fall back to buffer_transcription when lines are empty
+
         const lines = (payload.lines || []).filter((l) => l.text && l.text.trim());
         if (lines.length === 0) return;
 
-        // Map lines to transcript entries (stable like WLK demo)
-        const mapped = lines.map((l) => {
-          const ts = tsFromTimeString(l.end) || Date.now() / 1000;
-          return {
-            text: cleanText(l.text || ""),
-            speaker: l.speaker ?? "unknown",
-            lang: l.detected_language || payload.lang || payload.language || "unknown",
-            timestamp: ts,
-            source: "wlk",
-          };
-        });
-        setWlkTranscripts(mapped.reverse().slice(0, 120));
+        const mapped = lines.map((l) => ({
+          text: cleanText(l.text || ""),
+          speaker: l.speaker ?? "unknown",
+          lang: l.detected_language || payload.lang || payload.language || "unknown",
+          timestamp: Date.now() / 1000,
+          source: "wlk",
+        }));
+        setWlkTranscripts((prev) => [...mapped.reverse(), ...prev].slice(0, 200));
 
-        // Per-speaker buffering: send when new words added, time gap, or text changes
         const buffers = speakerBuffersRef.current;
-        const WORD_THRESHOLD = 10;
         mapped.forEach((entry) => {
           const words = entry.text.split(/\s+/).filter(Boolean);
           const wordCount = words.length;
           const buf = buffers[entry.speaker] || { wordCount: 0, ts: 0, text: "" };
-          const newWords = wordCount - buf.wordCount;
+          const newWords = Math.max(0, wordCount - buf.wordCount);
           const timeGap = entry.timestamp - (buf.ts || 0);
-          const textChanged = entry.text !== buf.text;
+          const lastSent = lastSentRef.current[entry.speaker] || { len: 0, ts: 0 };
+          const charGrowth = entry.text.length - (lastSent.len || 0);
 
-          if (!buf.text || newWords >= WORD_THRESHOLD || timeGap > SILENCE_SPLIT_SECONDS || textChanged) {
+          const shouldSend =
+            !buf.text ||
+            newWords >= WORD_THRESHOLD ||
+            timeGap > SILENCE_SPLIT_SECONDS ||
+            charGrowth >= 20;
+
+          if (shouldSend) {
             ingestToBackend(entry, payload);
             buffers[entry.speaker] = { wordCount, ts: entry.timestamp, text: entry.text };
+            lastSentRef.current[entry.speaker] = { len: entry.text.length, ts: entry.timestamp };
           }
         });
-
-        currentBufferRef.current = {
-          speaker: mapped[0]?.speaker || null,
-          text: mapped[0]?.text || "",
-          ts: mapped[0]?.timestamp || 0,
-          count: mapped.length,
-        };
       };
 
       wlkSocket.onerror = () => setStudentStatus("WhisperLiveKit error");
@@ -239,7 +228,6 @@ export default function StudentPage() {
       analysisSocketRef.current = null;
     }
 
-    currentBufferRef.current = { speaker: null, text: "", ts: 0 };
     speakerBuffersRef.current = {};
     setIsRecording(false);
     setStudentStatus("Stopped");
@@ -320,8 +308,7 @@ export default function StudentPage() {
         </div>
 
         <p className="muted" style={{ marginTop: "12px" }}>
-          Streams audio to a dedicated WhisperLiveKit container, relays transcripts to backend for alerts, off-topic checks,
-          and participation balance, and mirrors both feeds below.
+          Streams audio to WhisperLiveKit, relays transcripts to backend for per-speaker language/profanity checks, and shows flags immediately.
         </p>
         <button className="button" style={{ marginTop: "10px" }} onClick={() => navigate("/teacher")}>
           Go to Teacher Dashboard
@@ -329,10 +316,26 @@ export default function StudentPage() {
       </div>
 
       <div className="card" style={{ minHeight: "360px" }}>
-        <h3 style={{ marginTop: 0 }}>WhisperLiveKit (raw)</h3>
+        <h3 style={{ marginTop: 0 }}>Live transcription (WLK)</h3>
         <TranscriptList transcripts={wlkTranscripts} />
-        <h3 style={{ marginTop: "18px" }}>Backend Analysis</h3>
+        <h3 style={{ marginTop: "16px" }}>Backend stream</h3>
         <TranscriptList transcripts={analysisTranscripts} />
+        <h3 style={{ marginTop: "16px" }}>Flags</h3>
+        <div className="flag-panel">
+          {flags.length === 0 && <div className="muted">No flags yet.</div>}
+          {flags.map((f, idx) => (
+            <div key={idx} className="flag-item">
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <strong>{f.speaker || "unknown"}</strong>
+                <span className="pill" style={{ background: "#fef9c3", color: "#92400e" }}>{f.lang}</span>
+              </div>
+              <div style={{ fontSize: "12px", marginTop: "4px" }} className="muted">
+                {(f.alerts || []).map((a) => a.msg).join(" · ") || f.source}
+              </div>
+              <div style={{ marginTop: "6px" }}>{f.text}</div>
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   );

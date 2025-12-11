@@ -5,12 +5,12 @@ export default function GroupCard({ groupId, data, onSelect }) {
     ? "#ef4444"
     : data.last?.alerts?.some((a) => a.type === "LANGUAGE")
     ? "#f59e0b"
-    : data.last?.alerts?.some((a) => a.type === "TOPIC")
+    : data.last?.alerts?.some((a) => a.type?.includes("TOPIC"))
     ? "#fb923c"
     : "#22c55e";
 
   return (
-    <div className="card" style={{ borderColor }}>
+    <div className="card" style={{ borderColor, borderWidth: 2, borderStyle: "solid" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <strong>{groupId}</strong>
         <span className="pill" style={{ background: "#f1f5f9" }}>{data.last?.lang || "??"}</span>
@@ -24,17 +24,14 @@ export default function GroupCard({ groupId, data, onSelect }) {
       <div className="muted" style={{ fontSize: "12px" }}>
         {data.last ? fmtTime(data.last.timestamp) : "—"}
       </div>
-      <p style={{ margin: "8px 0 6px 0" }}>{data.last?.text || <span className="muted">Waiting for speech...</span>}</p>
+      <p style={{ margin: "8px 0 6px 0" }}>{data.last?.text || <span className="muted">Waiting…</span>}</p>
       <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
         <span className="pill" style={{ background: "#e0f2fe", color: "#075985" }}>
-          Topic {data.last?.topic_score}
+          Topic {data.last?.topic_score || ""}
         </span>
-        <span className="pill" style={{ background: "#dcfce7", color: "#166534" }}>
-          {data.last?.dominance || "—"} · {data.last?.speech_ratio ?? 0}
-        </span>
-        {data.last?.silence && (
-          <span className="pill" style={{ background: "#fee2e2", color: "#b91c1c" }}>
-            Silence
+        {data.last?.dominance_state && (
+          <span className="pill" style={{ background: "#dcfce7", color: "#166534" }}>
+            {data.last?.dominance_state} · {data.last?.speech_ratio ?? 0}
           </span>
         )}
       </div>

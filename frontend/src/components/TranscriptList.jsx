@@ -1,12 +1,13 @@
 import { fmtTime } from "../lib/utils";
 
-export default function TranscriptList({ transcripts }) {
+export default function TranscriptList({ transcripts, title }) {
   if (!transcripts || transcripts.length === 0) {
     return <div className="muted">No transcript yet.</div>;
   }
 
   return (
-    <div className="list" style={{ marginTop: "12px", maxHeight: "480px", overflowY: "auto" }}>
+    <div className="list" style={{ marginTop: "8px", maxHeight: "420px", overflowY: "auto" }}>
+      {title && <div style={{ fontWeight: 700 }}>{title}</div>}
       {transcripts.map((entry, idx) => (
         <div key={idx} className="transcript">
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -17,8 +18,7 @@ export default function TranscriptList({ transcripts }) {
             )}
           </div>
           <div className="muted" style={{ fontSize: "12px" }}>
-            Topic {entry.topic_score || "—"} · {entry.dominance || "—"} · speech {entry.speech_ratio ?? "—"}
-            {entry.target_topic ? ` · Topic: ${entry.target_topic}` : ""}
+            {entry.target_topic ? `Topic: ${entry.target_topic}` : ""}
             {entry.speaker ? ` · Speaker: ${entry.speaker}` : ""}
           </div>
           <p style={{ margin: "6px 0" }}>{entry.text}</p>
@@ -35,11 +35,6 @@ export default function TranscriptList({ transcripts }) {
                 ⚠ {a.msg}
               </span>
             ))}
-            {entry.silence && (
-              <span className="pill" style={{ background: "#fee2e2", color: "#b91c1c" }}>
-                Silence flagged
-              </span>
-            )}
           </div>
         </div>
       ))}

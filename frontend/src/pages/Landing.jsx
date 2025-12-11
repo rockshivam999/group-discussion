@@ -6,8 +6,8 @@ export default function Landing() {
       <div className="card">
         <h2 style={{ marginTop: 0 }}>Welcome to Classroom Sentinel</h2>
         <p className="muted">
-          Pick a view: Teacher dashboard to monitor all groups, or Student to start a group mic with topic context for
-          off-topic checks.
+          Two live dashboards: Teacher monitors all groups; Student opens mic, sees live transcription, and flags when
+          language or profanity issues occur.
         </p>
         <div style={{ display: "flex", gap: "12px", flexWrap: "wrap", marginTop: "12px" }}>
           <Link className="button primary" to="/teacher">
@@ -19,11 +19,11 @@ export default function Landing() {
         </div>
       </div>
       <div className="card">
-        <h3 style={{ marginTop: 0 }}>Tips</h3>
+        <h3 style={{ marginTop: 0 }}>What happens</h3>
         <ul className="muted" style={{ paddingLeft: "18px" }}>
-          <li>Student view asks for Group ID, Topic, and a short description.</li>
-          <li>Teacher dashboard shows live transcripts, topic score, dominance, and alerts.</li>
-          <li>Open both routes in separate tabs/windows to monitor live.</li>
+          <li>Student streams mic to WhisperLiveKit and forwards transcripts to backend.</li>
+          <li>Backend tracks per-speaker words; every +10 words triggers language check; every chunk checks profanity.</li>
+          <li>LLM stub runs every 60s to emit dominance/off-topic insights.</li>
         </ul>
       </div>
     </div>

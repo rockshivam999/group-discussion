@@ -10,7 +10,7 @@ export default function Header() {
       <div>
         <h1 style={{ margin: 0, fontSize: "28px" }}>Classroom Sentinel</h1>
         <p className="muted" style={{ margin: 0 }}>
-          Real-time group discussion monitor (FastAPI + React)
+          Real-time group monitor (WhisperLiveKit + FastAPI + React)
         </p>
       </div>
       <div className="tabs">

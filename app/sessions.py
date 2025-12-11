@@ -1,15 +1,24 @@
 import logging
-import os
 import random
+import shlex
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
-import shlex
 
 try:
     import docker
-except Exception:  # pragma: no cover - docker not always available in dev
+except Exception:  # pragma: no cover - docker may be unavailable
     docker = None
+
+from .config import (
+    HISTORY_LIMIT,
+    WLK_ARGS,
+    WLK_HOST,
+    WLK_IMAGE,
+    WLK_MANAGED,
+    WLK_PORT,
+    WLK_SINGLETON,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,33 +38,24 @@ class GroupSession:
     wlk_ws_url: Optional[str] = None
     history: List[dict] = field(default_factory=list)
     last_summary_at: float = 0.0
-    tap_task: Optional[object] = None  # asyncio.Task
-    last_lang_word_idx: int = 0
-    last_profanity_word_idx: int = 0
-    total_word_count: int = 0
-    lang_word_buffer: int = 0
     last_text_by_speaker: Dict[str, str] = field(default_factory=dict)
+    lang_word_buffer_by_speaker: Dict[str, int] = field(default_factory=dict)
 
 
 class GroupRegistry:
-    """
-    Tracks per-group WhisperLiveKit containers and history.
-    """
+    """Tracks per-group WhisperLiveKit endpoints and in-memory history."""
 
     def __init__(self) -> None:
         self.sessions: Dict[str, GroupSession] = {}
-        self.max_history = int(os.getenv("HISTORY_LIMIT", "200"))
-        self.image = os.getenv("WLK_IMAGE", "quentinfuxa/whisperlivekit:latest")
-        # Use host.docker.internal by default so browsers on host can reach ephemeral ports
-        self.external_host = os.getenv("WLK_HOST", "host.docker.internal")
-        self.container_port = int(os.getenv("WLK_PORT", "8000"))
-        self.singleton = os.getenv("WLK_SINGLETON", "1") not in ("0", "false", "False")
-        self.managed = os.getenv("WLK_MANAGED", "1") not in ("0", "false", "False")
+        self.max_history = HISTORY_LIMIT
+        self.image = WLK_IMAGE
+        self.external_host = WLK_HOST
+        self.container_port = WLK_PORT
+        self.singleton = WLK_SINGLETON
+        self.managed = WLK_MANAGED
         self.shared_container_id: Optional[str] = None
         self.shared_ws_url: Optional[str] = None
-        # Allow passing arbitrary WLK CLI args (e.g., "--diarization --model small")
-        self.container_args = shlex.split(os.getenv("WLK_ARGS", "--diarization"))
-        # Only initialize Docker client when managing containers
+        self.container_args = shlex.split(WLK_ARGS)
         if self.managed and docker:
             try:
                 self.docker_client = docker.from_env()
@@ -70,7 +70,6 @@ class GroupRegistry:
     ) -> GroupSession:
         session = self.sessions.get(group_id)
         if session:
-            # Update metadata if it changed
             session.topic = topic
             session.description = description
             session.allowed_language = allowed_language
@@ -79,14 +78,8 @@ class GroupRegistry:
                 cid, url = self._ensure_wlk_endpoint(group_id)
                 session.wlk_container_id = cid
                 session.wlk_ws_url = url
-                logger.info("Refreshed WhisperLiveKit for %s at %s", group_id, session.wlk_ws_url)
-                print(f"[WLK] Refreshed for {group_id} -> {session.wlk_ws_url}")
-            # Reset counters for a fresh session start
-            session.last_lang_word_idx = 0
-            session.last_profanity_word_idx = 0
-            session.total_word_count = 0
-            session.lang_word_buffer = 0
             session.last_text_by_speaker = {}
+            session.lang_word_buffer_by_speaker = {}
             return session
 
         container_id, ws_url = self._ensure_wlk_endpoint(group_id)
@@ -98,18 +91,11 @@ class GroupRegistry:
             target_embedding=embedding,
             wlk_container_id=container_id,
             wlk_ws_url=ws_url,
-            total_word_count=0,
-            last_lang_word_idx=0,
-            last_profanity_word_idx=0,
         )
         self.sessions[group_id] = session
         return session
 
     def _ensure_wlk_endpoint(self, group_id: str) -> Tuple[Optional[str], Optional[str]]:
-        """
-        When singleton mode is on (default), share one WLK container across groups.
-        Otherwise start a dedicated container per group.
-        """
         if not self.managed:
             url = f"ws://{self.external_host}:{self.container_port}/asr"
             if self.singleton:
@@ -126,13 +112,8 @@ class GroupRegistry:
         return self._start_wlk_container(group_id)
 
     def _start_wlk_container(self, name_hint: str) -> Tuple[Optional[str], Optional[str]]:
-        """
-        Launch a WhisperLiveKit container. If docker is unavailable, return (None, None)
-        and rely on an externally provided WLK URL.
-        """
         if not self.docker_client:
             logger.warning("Docker client not available; unable to start WhisperLiveKit container")
-            print("[WLK] Docker client unavailable; cannot start container")
             return None, None
 
         container_name = _pick_random_name(f"wlk-{name_hint.lower()}")
@@ -141,7 +122,7 @@ class GroupRegistry:
                 self.image,
                 name=container_name,
                 detach=True,
-                ports={f"{self.container_port}/tcp": None},  # let Docker pick host port
+                ports={f"{self.container_port}/tcp": None},
                 environment={"PORT": str(self.container_port)},
                 command=self.container_args,
             )
@@ -149,11 +130,9 @@ class GroupRegistry:
             host_port = container.attrs["NetworkSettings"]["Ports"][f"{self.container_port}/tcp"][0]["HostPort"]
             ws_url = f"ws://{self.external_host}:{host_port}/asr"
             logger.info("Started WhisperLiveKit for %s at %s (container=%s)", name_hint, ws_url, container.id)
-            print(f"[WLK] Started for {name_hint} -> {ws_url} (container={container.id})")
             return container.id, ws_url
         except Exception as exc:  # pragma: no cover - runtime env may vary
             logger.error("Failed to start WhisperLiveKit container for %s: %s", name_hint, exc)
-            print(f"[WLK] Failed to start for {name_hint}: {exc}")
             return None, None
 
     def append_history(self, group_id: str, entry: dict) -> List[dict]:
@@ -177,6 +156,23 @@ class GroupRegistry:
         if not session:
             return []
         return session.history
+
+    def get_pending_history(self, group_id: str, since_ts: float) -> List[dict]:
+        session = self.sessions.get(group_id)
+        if not session:
+            return []
+        return [e for e in session.history if e.get("timestamp", 0) > since_ts]
+
+    def get_all_history(self, limit: int = 500) -> List[dict]:
+        items: List[dict] = []
+        for _, session in self.sessions.items():
+            for entry in session.history:
+                if entry:
+                    items.append(entry)
+        items.sort(key=lambda e: e.get("timestamp", 0))
+        if limit and len(items) > limit:
+            items = items[-limit:]
+        return items
 
     def update_summary_timestamp(self, group_id: str) -> None:
         session = self.sessions.get(group_id)

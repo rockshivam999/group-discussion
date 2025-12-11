@@ -5,6 +5,8 @@ DEFAULT_TARGET_TOPIC = "Global warming and climate change solutions"
 DEFAULT_TARGET_DESCRIPTION = ""
 DEFAULT_ALLOWED_LANGUAGE = "en"
 MERGE_WINDOW_SECONDS = 10.0
+LLM_SUMMARY_INTERVAL_SECONDS = 60.0
+LLM_ENABLE_STUB = True
 
 # Allow all for prototype; tighten for production.
 CORS_ALLOW_ORIGINS: List[str] = ["*"]

@@ -23,7 +23,8 @@ export default function StudentPage() {
   const analysisSocketRef = useRef(null);
   const [wlkTranscripts, setWlkTranscripts] = useState([]);
   const [analysisTranscripts, setAnalysisTranscripts] = useState([]);
-  const currentBufferRef = useRef({ speaker: null, text: "", ts: 0 });
+  const currentBufferRef = useRef({ speaker: null, text: "", ts: 0, count: 0 });
+  const speakerBuffersRef = useRef({});
   const navigate = useNavigate();
   const SILENCE_SPLIT_SECONDS = 10;
 
@@ -32,6 +33,18 @@ export default function StudentPage() {
     let cleaned = t.replace(/\b(\w+)(?:\s+\1\b){2,}/gi, "$1 $1");
     cleaned = cleaned.replace(/(\b[\w'-]+(?:\s+[\w'-]+){2,7})\s+(?:\1\s*){1,}/gi, "$1");
     return cleaned.trim();
+  };
+
+  const tsFromTimeString = (t) => {
+    if (!t || typeof t !== "string") return null;
+    const parts = t.split(":").map(Number);
+    if (parts.length === 3) {
+      return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    }
+    if (parts.length === 2) {
+      return parts[0] * 60 + parts[1];
+    }
+    return null;
   };
 
   const startRecording = async () => {
@@ -123,72 +136,47 @@ export default function StudentPage() {
         } catch (_) {
           payload = { text: event.data };
         }
-
+        console.log(payload);
         // Prefer finalized lines; fall back to buffer_transcription when lines are empty
-        const lines = payload.lines || [];
-        const latest = lines.find((l) => l.text);
-        const fallbackBuffer = (payload.buffer_transcription || payload.text || payload.transcript || "").trim();
-        const rawText = (latest && latest.text ? latest.text : fallbackBuffer).trim();
-        const text = cleanText(rawText);
-        if (!text) return;
+        const lines = (payload.lines || []).filter((l) => l.text && l.text.trim());
+        if (lines.length === 0) return;
 
-        const lineSpeaker = latest?.speaker;
-        const lineLang = latest?.detected_language;
-
-        const ts = payload.timestamp || Date.now() / 1000;
-        const speaker = payload.speaker || payload.spk || lineSpeaker || currentBufferRef.current.speaker || "unknown";
-        const lang = payload.lang || payload.language || lineLang || "unknown";
-        const norm = (text || "").trim();
-        if (!norm) return;
-
-        const buffer = currentBufferRef.current;
-        const sameSpeaker = buffer.speaker === speaker;
-        const closeInTime = ts - (buffer.ts || 0) < SILENCE_SPLIT_SECONDS;
-
-        // Merge into current card if same speaker and within silence window
-        if (buffer.text && sameSpeaker && closeInTime) {
-          let mergedText;
-          if (norm.startsWith(buffer.text)) {
-            mergedText = norm;
-          } else if (buffer.text.startsWith(norm)) {
-            mergedText = buffer.text;
-          } else {
-            mergedText = `${buffer.text} ${norm}`.trim();
-          }
-          if (mergedText === buffer.text) return;
-          const updatedEntry = {
-            text: mergedText,
+        // Map lines to transcript entries (stable like WLK demo)
+        const mapped = lines.map((l) => {
+          const ts = tsFromTimeString(l.end) || Date.now() / 1000;
+          return {
+            text: cleanText(l.text || ""),
+            speaker: l.speaker ?? "unknown",
+            lang: l.detected_language || payload.lang || payload.language || "unknown",
             timestamp: ts,
-            lang,
-            speaker,
             source: "wlk",
           };
-          currentBufferRef.current = { speaker, text: mergedText, ts };
-          setWlkTranscripts((prev) => {
-            const next = [...prev];
-            if (next.length > 0) {
-              next[0] = { ...next[0], ...updatedEntry };
-            } else {
-              next.unshift(updatedEntry);
-            }
-            return next.slice(0, 120);
-          });
-          ingestToBackend(updatedEntry, payload);
-          return;
-        }
+        });
+        setWlkTranscripts(mapped.reverse().slice(0, 120));
 
-        // New card (speaker switch or silence gap)
-        const entry = {
-          text: norm,
-          timestamp: ts,
-          lang,
-          speaker,
-          source: "wlk",
+        // Per-speaker buffering: send when new words added, time gap, or text changes
+        const buffers = speakerBuffersRef.current;
+        const WORD_THRESHOLD = 10;
+        mapped.forEach((entry) => {
+          const words = entry.text.split(/\s+/).filter(Boolean);
+          const wordCount = words.length;
+          const buf = buffers[entry.speaker] || { wordCount: 0, ts: 0, text: "" };
+          const newWords = wordCount - buf.wordCount;
+          const timeGap = entry.timestamp - (buf.ts || 0);
+          const textChanged = entry.text !== buf.text;
+
+          if (!buf.text || newWords >= WORD_THRESHOLD || timeGap > SILENCE_SPLIT_SECONDS || textChanged) {
+            ingestToBackend(entry, payload);
+            buffers[entry.speaker] = { wordCount, ts: entry.timestamp, text: entry.text };
+          }
+        });
+
+        currentBufferRef.current = {
+          speaker: mapped[0]?.speaker || null,
+          text: mapped[0]?.text || "",
+          ts: mapped[0]?.timestamp || 0,
+          count: mapped.length,
         };
-        currentBufferRef.current = { speaker, text: norm, ts };
-        console.log("[WLK] message", payload);
-        setWlkTranscripts((prev) => [entry, ...prev].slice(0, 120));
-        ingestToBackend(entry, payload);
       };
 
       wlkSocket.onerror = () => setStudentStatus("WhisperLiveKit error");
@@ -246,6 +234,7 @@ export default function StudentPage() {
     }
 
     currentBufferRef.current = { speaker: null, text: "", ts: 0 };
+    speakerBuffersRef.current = {};
     setIsRecording(false);
     setStudentStatus("Stopped");
     setAnalysisStatus("Idle");

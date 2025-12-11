@@ -20,6 +20,20 @@ def encode_topic(topic: str, description: str = ""):
     return text, TOPIC_MODEL.encode(text, convert_to_tensor=True)
 
 
+def analyze_live_alerts(text: str, language: str, allowed_language: str = DEFAULT_ALLOWED_LANGUAGE, check_language: bool = True):
+    alerts = []
+    lang = (language or "").lower()
+    allowed = (allowed_language or "").lower()
+
+    if profanity.contains_profanity(text):
+        alerts.append({"type": "OFFENSIVE", "msg": "Foul or inappropriate language detected"})
+
+    if check_language and allowed and lang and lang != allowed:
+        alerts.append({"type": "LANGUAGE", "msg": f"Speaking {lang} instead of {allowed}"})
+
+    return alerts
+
+
 def analyze_text(
     text: str,
     language: str,

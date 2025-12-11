@@ -7,12 +7,14 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from .analysis import analyze_text, compute_dominance, encode_topic, collapse_repetitions
+from .analysis import analyze_live_alerts, analyze_text, compute_dominance, encode_topic, collapse_repetitions
 from .config import (
     CORS_ALLOW_ORIGINS,
     DEFAULT_ALLOWED_LANGUAGE,
     DEFAULT_TARGET_DESCRIPTION,
     DEFAULT_TARGET_TOPIC,
+    LLM_ENABLE_STUB,
+    LLM_SUMMARY_INTERVAL_SECONDS,
     MERGE_WINDOW_SECONDS,
 )
 from .connections import ConnectionManager
@@ -113,8 +115,12 @@ async def ingest_event(group_id: str, event: IngestEvent):
     if not session:
         raise HTTPException(status_code=404, detail="Group session not found. Create a session first.")
 
-    entry = await process_event(group_id, event, session)
-    return {"status": "ok", "entry": entry}
+    try:
+        entry = await process_event(group_id, event, session)
+        return {"status": "ok", "entry": entry}
+    except Exception as exc:
+        logger.exception("Error ingesting event for %s: %s", group_id, exc)
+        raise HTTPException(status_code=500, detail="Failed to process event")
 
 
 @app.get("/groups/{group_id}/history")
@@ -167,13 +173,36 @@ async def process_event(group_id: str, event: IngestEvent, session) -> Dict:
         "allowed_language": session.allowed_language,
     }
 
-    alerts, topic_score = analyze_text(
-        text=base_entry["text"],
-        language=lang,
-        target_embedding=session.target_embedding,
-        target_topic=session.topic,
-        allowed_language=session.allowed_language,
+    # Track new words to avoid re-flagging older content
+    words = (base_entry["text"] or "").split()
+    alerts = []
+
+    # Always run profanity on the new text chunk
+    alerts.extend(
+        analyze_live_alerts(
+            text=base_entry["text"],
+            language=lang,
+            allowed_language=session.allowed_language,
+            check_language=False,
+        )
     )
+
+    # Update cumulative word counts for language checks
+    session.total_word_count += len(words)
+    total_words = session.total_word_count
+
+    # Language check every +10 new words (cumulative)
+    new_lang_words = total_words - session.last_lang_word_idx
+    if new_lang_words >= 10:
+        alerts.extend(
+            analyze_live_alerts(
+                text=" ".join(words),
+                language=lang,
+                allowed_language=session.allowed_language,
+                check_language=True,
+            )
+        )
+        session.last_lang_word_idx = total_words
     logger.info("Raw transcript event for %s (speaker=%s): %s", group_id, speaker, event.text)
 
     history = registry.get_history(group_id)
@@ -196,12 +225,12 @@ async def process_event(group_id: str, event: IngestEvent, session) -> Dict:
             history[-1] = base_entry
 
     prospective_history = (history if merged else history + [base_entry]) if history is not None else [base_entry]
-    dominance_state, dominance_speaker = compute_dominance(prospective_history)
+    dominance_state, dominance_speaker = ("PENDING_LLM", None)
 
     entry = {
         **base_entry,
         "alerts": alerts,
-        "topic_score": f"{topic_score:.2f}",
+        "topic_score": "",
         "dominance_state": dominance_state,
         "dominance_speaker": dominance_speaker,
         "speech_ratio": None,
@@ -222,9 +251,12 @@ async def summary_scheduler():
     """
     Periodically collect recent history and hand it to a larger model (stubbed).
     """
+    if not LLM_ENABLE_STUB:
+        logger.info("LLM summary scheduler disabled (LLM_ENABLE_STUB=0)")
+        return
     logger.info("Starting summary scheduler")
     while True:
-        await asyncio.sleep(90)
+        await asyncio.sleep(LLM_SUMMARY_INTERVAL_SECONDS)
         for gid, session in list(registry.sessions.items()):
             pending = [e for e in session.history if e.get("timestamp", 0) > session.last_summary_at]
             if not pending:
@@ -232,7 +264,19 @@ async def summary_scheduler():
             text_blob = "\n".join(
                 f"[{e.get('speaker') or 'unknown'}] {e.get('text')}" for e in pending if e.get("text")
             )
-            await send_to_big_model_stub(gid, text_blob, session.topic, session.description)
+            summary = await send_to_big_model_stub(gid, text_blob, session.topic, session.description)
+            payload = {
+                "group_id": gid,
+                "source": "llm",
+                "text": summary.get("summary", "LLM summary"),
+                "alerts": summary.get("alerts", []),
+                "timestamp": time.time(),
+                "dominance_state": summary.get("dominance", "PENDING"),
+                "dominance_speaker": summary.get("dominant_speaker"),
+                "topic_score": "",
+                "lang": "unknown",
+            }
+            await manager.broadcast_alert(payload)
             registry.update_summary_timestamp(gid)
 
 
@@ -240,10 +284,26 @@ async def send_to_big_model_stub(group_id: str, text_blob: str, topic: str, desc
     """
     Placeholder hook to send text to an LLM / external API.
     """
+    import random
+
+    summary = f"LLM summary (mock): {text_blob[:200]}..."
+    dominant_speaker = f"spk{random.randint(1,3)}"
+    alerts = []
+    if random.random() > 0.5:
+        alerts.append({"type": "TOPIC_LLM", "msg": "Possible off-topic drift (mocked)"})
+    dominance = random.choice(["DOMINATING", "BALANCED", "QUIET"])
+    result = {
+        "summary": summary,
+        "alerts": alerts,
+        "dominance": dominance,
+        "dominant_speaker": dominant_speaker,
+    }
     logger.info(
-        "LLM stub for group %s | chars=%d | topic=%s | desc=%s",
+        "LLM stub for group %s | chars=%d | topic=%s | desc=%s | result=%s",
         group_id,
         len(text_blob),
         topic,
         description,
+        result,
     )
+    return result

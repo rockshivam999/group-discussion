@@ -30,6 +30,9 @@ class GroupSession:
     history: List[dict] = field(default_factory=list)
     last_summary_at: float = 0.0
     tap_task: Optional[object] = None  # asyncio.Task
+    last_lang_word_idx: int = 0
+    last_profanity_word_idx: int = 0
+    total_word_count: int = 0
 
 
 class GroupRegistry:
@@ -76,6 +79,10 @@ class GroupRegistry:
                 session.wlk_ws_url = url
                 logger.info("Refreshed WhisperLiveKit for %s at %s", group_id, session.wlk_ws_url)
                 print(f"[WLK] Refreshed for {group_id} -> {session.wlk_ws_url}")
+            # Reset counters for a fresh session start
+            session.last_lang_word_idx = 0
+            session.last_profanity_word_idx = 0
+            session.total_word_count = 0
             return session
 
         container_id, ws_url = self._ensure_wlk_endpoint(group_id)
@@ -87,6 +94,9 @@ class GroupRegistry:
             target_embedding=embedding,
             wlk_container_id=container_id,
             wlk_ws_url=ws_url,
+            total_word_count=0,
+            last_lang_word_idx=0,
+            last_profanity_word_idx=0,
         )
         self.sessions[group_id] = session
         return session

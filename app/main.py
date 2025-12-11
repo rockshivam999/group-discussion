@@ -173,41 +173,44 @@ async def process_event(group_id: str, event: IngestEvent, session) -> Dict:
         "allowed_language": session.allowed_language,
     }
 
-    # Track new words to avoid re-flagging older content
-    words = (base_entry["text"] or "").split()
     alerts = []
-
     prev_text = session.last_text_by_speaker.get(speaker, "")
     if base_entry["text"].startswith(prev_text):
         new_segment = base_entry["text"][len(prev_text):].strip()
     else:
-        new_segment = base_entry["text"]
+        new_segment = base_entry["text"].strip()
 
-    new_words_count = len(new_segment.split())
+    new_words_count = len(new_segment.split()) if new_segment else 0
 
-    # Profanity on new segment only
-    if new_segment:
-        alerts.extend(
-            analyze_live_alerts(
-                text=new_segment,
-                language=lang,
-                allowed_language=session.allowed_language,
-                check_language=False,
-            )
+    # Profanity on only the new segment (fallback to full text if we somehow missed diff)
+    if new_segment or base_entry["text"]:
+        segment_for_profanity = new_segment or base_entry["text"]
+        prof_alerts = analyze_live_alerts(
+            text=segment_for_profanity,
+            language=lang,
+            allowed_language=session.allowed_language,
+            check_language=False,
+            check_profanity=True,
         )
+        for a in prof_alerts:
+            if a.get("type") == "OFFENSIVE":
+                a["msg"] = f"{a['msg']} (speaker={speaker}, lang={lang})"
+        alerts.extend(prof_alerts)
 
     # Language check every +10 new words (buffered)
-    session.lang_word_buffer += new_words_count
-    if session.lang_word_buffer >= 10:
-        alerts.extend(
-            analyze_live_alerts(
-                text=new_segment or base_entry["text"],
-                language=lang,
-                allowed_language=session.allowed_language,
-                check_language=True,
+    if new_words_count > 0:
+        session.lang_word_buffer += new_words_count
+        if session.lang_word_buffer >= 10:
+            alerts.extend(
+                analyze_live_alerts(
+                    text=new_segment or base_entry["text"],
+                    language=lang,
+                    allowed_language=session.allowed_language,
+                    check_language=True,
+                    check_profanity=False,
+                )
             )
-        )
-        session.lang_word_buffer = 0
+            session.lang_word_buffer = 0
 
     session.last_text_by_speaker[speaker] = base_entry["text"]
     logger.info("Raw transcript event for %s (speaker=%s): %s", group_id, speaker, event.text)

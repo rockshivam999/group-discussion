@@ -44,7 +44,7 @@ def extract_flagged_words(text: str) -> List[str]:
     flagged: set[str] = set()
 
     # Basic word-level check.
-    words = re.findall(r"[\\w'*]+", lowered)
+    words = re.findall(r"[\w'*]+", lowered)
     for w in words:
         if _check(w):
             flagged.add(w)
@@ -66,16 +66,20 @@ def extract_flagged_words(text: str) -> List[str]:
 
 async def push_history_periodically(websocket: WebSocket, stop_event: asyncio.Event) -> None:
     """Every 30 seconds send the full history snapshot to the connected client."""
-    while not stop_event.is_set():
-        await asyncio.sleep(30)
-        async with history_lock:
-            snapshot = list(dashboard_snapshot)
-        try:
-            await websocket.send_json({"type": "history", "history": snapshot})
-            logger.info("Sent history snapshot with %d entries", len(snapshot))
-        except Exception as exc:  # pragma: no cover - transport errors
-            logger.warning("Failed to send history snapshot: %s", exc)
-            break
+    try:
+        while not stop_event.is_set():
+            await asyncio.sleep(30)
+            async with history_lock:
+                snapshot = list(dashboard_snapshot)
+            try:
+                await websocket.send_json({"type": "history", "history": snapshot})
+                logger.info("Sent history snapshot with %d entries", len(snapshot))
+            except Exception as exc:  # pragma: no cover - transport errors
+                logger.warning("Failed to send history snapshot: %s", exc)
+                break
+    except asyncio.CancelledError:
+        # Task cancelled because websocket closed; exit quietly.
+        return
 
 
 @app.websocket("/monitor")
@@ -110,6 +114,12 @@ async def monitor(websocket: WebSocket) -> None:
                 await websocket.send_json({"type": "ack", "received": True, "mode": "snapshot"})
                 continue
 
+            print("got ==> ",data)
+
+            if data.get("type") != "delta":
+                # Ignore other message types for profanity processing.
+                continue
+
             text = (data.get("text") or "").strip()
             if not text:
                 continue
@@ -122,6 +132,8 @@ async def monitor(websocket: WebSocket) -> None:
                 "end": data.get("end"),
                 "timestamp": data.get("timestamp") or utc_now_iso(),
             }
+            
+            print("Got i websocked :",text)
 
             flagged_words = extract_flagged_words(text)
             if flagged_words:
@@ -137,7 +149,7 @@ async def monitor(websocket: WebSocket) -> None:
     finally:
         stop_event.set()
         history_task.cancel()
-        with suppress(Exception):
+        with suppress(Exception, asyncio.CancelledError):
             await history_task
 
 

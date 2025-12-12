@@ -32,7 +32,7 @@ services:
 
   whisperlivekit:
     build:
-      context: ../WhisperLiveKit
+      context: ./WhisperLiveKit
       dockerfile: Dockerfile.cpu
     environment:
       - PORT=8000

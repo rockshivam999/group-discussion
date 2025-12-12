@@ -25,13 +25,14 @@ RUN pip install --no-cache-dir \
     torchaudio==2.1.1 \
     torchvision==0.16.1 \
     diart==0.9.2 \
+    huggingface_hub==0.16.4 \
     --extra-index-url https://download.pytorch.org/whl/cpu
 
 COPY . .
 COPY hf_token_temp /tmp/hf_token_temp
 
 # Install WhisperLiveKit from local source with diarization extras
-RUN pip install --no-cache-dir ".[diarization]"
+RUN pip install --no-cache-dir ".[diarization]" "huggingface_hub<0.27.0"
 
 # Enable in-container caching for Hugging Face models
 VOLUME ["/root/.cache/huggingface/hub"]
@@ -57,7 +58,6 @@ EXPOSE 8000
 ENTRYPOINT ["whisperlivekit-server","--host", "0.0.0.0","--diarization","--diarization-backend", "diart"]
 
 CMD ["--model", "base"]
-
 
 
 # docker pull ayushdh96/whisper-diarization

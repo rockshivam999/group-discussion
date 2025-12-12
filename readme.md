@@ -7,7 +7,7 @@ WORKDIR /app
 
 ARG EXTRAS
 ARG HF_PRECACHE_DIR
-ARG HF_TKN_FILE="/Users/prem/.cache/huggingface/token"
+ARG HF_TKN_FILE
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -19,25 +19,19 @@ RUN apt-get update && \
         libportaudio2 && \
     rm -rf /var/lib/apt/lists/*
 
-# Install CPU-only PyTorch
-# RUN pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+# Install CPU-only PyTorch and diarization deps
 RUN pip install --no-cache-dir \
     torch==2.1.1 \
     torchaudio==2.1.1 \
     torchvision==0.16.1 \
     diart==0.9.2 \
-    whisperlivekit${EXTRAS:+[$EXTRAS]} \
     --extra-index-url https://download.pytorch.org/whl/cpu
+
 COPY . .
 COPY hf_token_temp /tmp/hf_token_temp
-# Install WhisperLiveKit directly, allowing for optional dependencies
-# RUN if [ -n "$EXTRAS" ]; then \
-#       echo "Installing with extras: [$EXTRAS]"; \
-#       pip install --no-cache-dir whisperlivekit[$EXTRAS]; \
-#     else \
-#       echo "Installing base package only"; \
-#       pip install --no-cache-dir whisperlivekit; \
-#     fi
+
+# Install WhisperLiveKit from local source with diarization extras
+RUN pip install --no-cache-dir ".[diarization]"
 
 # Enable in-container caching for Hugging Face models
 VOLUME ["/root/.cache/huggingface/hub"]
@@ -62,7 +56,8 @@ EXPOSE 8000
 
 ENTRYPOINT ["whisperlivekit-server","--host", "0.0.0.0","--diarization","--diarization-backend", "diart"]
 
-CMD ["--model", "base","--language", "en","--segmentation-model", "pyannote/segmentation-3.0","--embedding-model", "speechbrain/spkrec-ecapa-voxceleb"]
+CMD ["--model", "base"]
+
 
 
 # docker pull ayushdh96/whisper-diarization

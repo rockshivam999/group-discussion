@@ -28,6 +28,8 @@ const allowedLanguageOptions = [
 ];
 
 function App() {
+  const isBrowser = typeof window !== "undefined";
+  const isTeacherView = isBrowser && window.location.pathname.startsWith("/teacher");
   const [wsUrl, setWsUrl] = useState(defaultWsUrl);
   const [connectionStatus, setConnectionStatus] = useState("disconnected");
   const [connectionError, setConnectionError] = useState("");
@@ -52,6 +54,9 @@ function App() {
   const backendReconnectRef = useRef(null);
   const fullTextRef = useRef("");
   const lastPhraseRef = useRef("");
+  const lastStartRef = useRef(null);
+  const lastEndRef = useRef(null);
+  const sentTokensRef = useRef([]);
   const chunkWindowRef = useRef([]);
   const historyRef = useRef("");
   const conversationRef = useRef([]);
@@ -68,6 +73,15 @@ function App() {
       return "";
     }
   }, []);
+
+  const teacherUrl = useMemo(() => {
+    if (!isBrowser) return "/teacher";
+    try {
+      return new URL("/teacher", window.location.href).toString();
+    } catch (err) {
+      return "/teacher";
+    }
+  }, [isBrowser]);
 
   const conversationHistoryText = useMemo(() => {
     return conversation
@@ -137,55 +151,81 @@ function App() {
     };
   }, []);
 
-  const updateLatestChunk = useCallback((historyText, lastLineMeta = null) => {
-    const previous = fullTextRef.current || "";
-    const trimmed = historyText.trim();
+  const updateLatestChunk = useCallback(
+    (stableText, lastLineMeta = null) => {
+      const trimmed = (stableText || "").trim();
+      if (!trimmed) return;
+      if (lastLineMeta && lastLineMeta.speaker === -2) return;
+      const startKey = lastLineMeta ? lastLineMeta.start : null;
+      const endKey = lastLineMeta ? lastLineMeta.end : null;
+      const tokens = trimmed.split(/\s+/).filter(Boolean);
 
-    // Only consider the newly appended portion to avoid re-counting the full transcript.
-    let delta = "";
-    if (trimmed && trimmed.startsWith(previous)) {
-      delta = trimmed.slice(previous.length).trim();
-    } else {
-      delta = trimmed;
-    }
-
-    fullTextRef.current = trimmed;
-    historyRef.current = trimmed;
-    
-    if (!delta) return;
-
-    console.log("Latest transcript addition:", delta);
-    if (lastLineMeta) {
-      sendDeltaToBackend({
-        type: "delta",
-        text: delta,
-        speaker: lastLineMeta.speaker ?? null,
-        start: lastLineMeta.start,
-        end: lastLineMeta.end,
-        detected_language: lastLineMeta.detected_language,
-        topic,
-        context: contextText,
-        allowed_language: allowedLanguage,
-        timestamp: lastLineMeta.timestamp || new Date().toISOString()
-      });
-    }
-
-    setChunkTotal((count) => count + 1);
-    setChunkWindow((prev) => {
-      const next = [...prev, delta];
-      chunkWindowRef.current = next;
-
-      if (next.length >= 10) {
-        const aggregate = next.join(" ");
-        setBatchAggregate(aggregate);
-        console.log("10-chunk aggregate ready (then reset):", aggregate);
-        chunkWindowRef.current = [];
-        return [];
+      let suffixTokens = tokens;
+      // New utterance (start changed): send full text and reset tracking.
+      if (lastStartRef.current === null || startKey !== lastStartRef.current) {
+        sentTokensRef.current = tokens;
+      } else {
+        // Same start; only send suffix beyond common prefix, but only if end advanced.
+        if (endKey !== null && lastEndRef.current !== null && endKey === lastEndRef.current) {
+          return;
+        }
+        const prevTokens = sentTokensRef.current || [];
+        let common = 0;
+        const maxLen = Math.min(prevTokens.length, tokens.length);
+        while (common < maxLen && prevTokens[common] === tokens[common]) {
+          common += 1;
+        }
+        suffixTokens = tokens.slice(common);
+        if (suffixTokens.length === 0) {
+          sentTokensRef.current = tokens;
+          lastStartRef.current = startKey;
+          lastEndRef.current = endKey;
+          return;
+        }
+        sentTokensRef.current = tokens;
       }
 
-      return next;
-    });
-  }, [allowedLanguage, contextText, sendDeltaToBackend, topic]);
+      lastStartRef.current = startKey;
+      lastEndRef.current = endKey;
+      const toSend = suffixTokens.join(" ").trim();
+      if (!toSend) return;
+      fullTextRef.current = trimmed;
+      historyRef.current = trimmed;
+
+      console.log("Latest transcript addition (time/token-based):", toSend);
+      if (lastLineMeta) {
+        sendDeltaToBackend({
+          type: "delta",
+          text: toSend,
+          speaker: lastLineMeta.speaker ?? null,
+          start: lastLineMeta.start,
+          end: lastLineMeta.end,
+          detected_language: lastLineMeta.detected_language,
+          topic,
+          context: contextText,
+          allowed_language: allowedLanguage,
+          timestamp: lastLineMeta.timestamp || new Date().toISOString()
+        });
+      }
+
+      setChunkTotal((count) => count + 1);
+      setChunkWindow((prev) => {
+        const next = [...prev, toSend];
+        chunkWindowRef.current = next;
+
+        if (next.length >= 10) {
+          const aggregate = next.join(" ");
+          setBatchAggregate(aggregate);
+          console.log("10-chunk aggregate ready (then reset):", aggregate);
+          chunkWindowRef.current = [];
+          return [];
+        }
+
+        return next;
+      });
+    },
+    [allowedLanguage, contextText, sendDeltaToBackend, topic]
+  );
 
   const sendSnapshotToBackend = useCallback(() => {
     const socket = backendSocketRef.current;
@@ -344,14 +384,6 @@ function App() {
 
         setConversation(effectiveLines);
 
-        const historyText = effectiveLines
-          .map((l) => {
-            const speaker = l.speaker !== undefined ? l.speaker : "?";
-            const translation = l.translation ? ` [${l.translation}]` : "";
-            return `S${speaker}: ${l.text}${translation}`;
-          })
-          .join(" | ");
-
         const latestStableMeta = (() => {
           for (let i = effectiveLines.length - 1; i >= 0; i--) {
             const line = effectiveLines[i];
@@ -369,9 +401,8 @@ function App() {
             lastPhraseRef.current = latestStableText;
             setLastPhrase(latestStableText);
           }
+          updateLatestChunk(latestStableText, latestStableMeta);
         }
-
-        updateLatestChunk(historyText, effectiveLines[effectiveLines.length - 1]);
       } catch (err) {
         console.error("Could not parse websocket payload", err);
       }
@@ -391,6 +422,8 @@ function App() {
     setConnectionError("");
     fullTextRef.current = "";
     historyRef.current = "";
+    lastStartRef.current = null;
+    lastEndRef.current = null;
     setLastPhrase("");
     lastPhraseRef.current = "";
     setChunkWindow([]);
@@ -438,7 +471,9 @@ function App() {
 
       socket.onopen = () => {
         setBackendStatus("connected");
-        sendSnapshotToBackend();
+        if (!isTeacherView) {
+          sendSnapshotToBackend();
+        }
       };
 
       socket.onerror = (err) => {
@@ -464,6 +499,8 @@ function App() {
           }
           if (payload.type === "history" && payload.history) {
             setTeacherHistory(payload.history);
+            const meta = payload.meta || {};
+            setAnalysisResult(mockAnalyzeSnapshot(payload.history, meta));
           }
         } catch (err) {
           console.warn("Could not parse backend message", err);
@@ -473,7 +510,7 @@ function App() {
       console.warn("Could not open backend websocket", err);
       setBackendStatus("error");
     }
-  }, [backendWsUrl, sendSnapshotToBackend]);
+  }, [backendWsUrl, isTeacherView, mockAnalyzeSnapshot, sendSnapshotToBackend]);
 
   const disconnect = useCallback(() => {
     if (socketRef.current) {
@@ -493,6 +530,8 @@ function App() {
     chunkWindowRef.current = [];
     fullTextRef.current = "";
     historyRef.current = "";
+    lastStartRef.current = null;
+    lastEndRef.current = null;
   }, [stopRecording]);
 
   useEffect(() => {
@@ -545,6 +584,7 @@ function App() {
         const historyJson = await historyRes.json();
         if (Array.isArray(historyJson.history)) {
           setTeacherHistory(historyJson.history);
+          setAnalysisResult(mockAnalyzeSnapshot(historyJson.history, historyJson.meta || {}));
         }
       } catch (err) {
         console.warn("Could not fetch conversation history", err);
@@ -554,11 +594,12 @@ function App() {
   }, [backendHttpBase, backendStatus]);
 
   useEffect(() => {
+    if (isTeacherView) return;
     const interval = setInterval(() => {
       sendSnapshotToBackend();
     }, 30000);
     return () => clearInterval(interval);
-  }, [sendSnapshotToBackend]);
+  }, [isTeacherView, sendSnapshotToBackend]);
 
   const resetCounters = () => {
     setLastPhrase("");
@@ -567,8 +608,102 @@ function App() {
     setChunkTotal(0);
     setBatchAggregate("");
     chunkWindowRef.current = [];
-    fullTextRef.current = historyRef.current;
+    fullTextRef.current = "";
+    historyRef.current = "";
+    lastStartRef.current = null;
+    lastEndRef.current = null;
   };
+
+  const teacherDashboardSection = (
+    <section className="panel teacher-dashboard">
+      <div className="teacher-header">
+        <div>
+          <h3 className="card-title">Teacher Dashboard</h3>
+          <p className="muted small">Moderation, full conversation, and automated insights</p>
+        </div>
+        <span className="pill muted">Auto-refresh every 30s</span>
+      </div>
+      <div className="teacher-grid">
+        <div className="teacher-card">
+          <h4 className="card-title">Flagged items ({flaggedItems.length})</h4>
+          {flaggedItems.length === 0 ? (
+            <p className="muted">No flagged language or mismatches yet.</p>
+          ) : (
+            <ul className="flagged-list">
+              {flaggedItems.map((item, idx) => (
+                <li key={`${item.timestamp || idx}-${idx}`}>
+                  <div className="flagged-line">
+                    <span className="pill">Speaker {item.speaker ?? "?"}</span>
+                    {item.flagged_reason === "language_mismatch" ? (
+                      <span className="pill muted">
+                        Language mismatch ({item.detected_language || "?"} vs allowed {item.allowed_language || "?"})
+                      </span>
+                    ) : (
+                      <span className="pill muted">Profanity</span>
+                    )}
+                  </div>
+                  <div className="flagged-text">{item.text}</div>
+                  {item.flagged_words && (
+                    <div className="muted small">Words: {item.flagged_words.join(", ")}</div>
+                  )}
+                  <div className="muted small">
+                    Topic: {item.topic || "n/a"} | Context: {item.context || "n/a"}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+        <div className="teacher-card">
+          <h4 className="card-title">Complete conversation</h4>
+          <div className="history">
+            <p className="history-title">Timeline</p>
+            <p className="history-text">{teacherConversationText || "No transcript yet."}</p>
+          </div>
+        </div>
+        <div className="teacher-card">
+          <h4 className="card-title">30s Analysis (mock)</h4>
+          {analysisResult ? (
+            <div className="analysis">
+              <p className="analysis-line"><strong>Participation balance:</strong> {analysisResult.participation_balance}</p>
+              <p className="analysis-line"><strong>Topic adherence:</strong> {analysisResult.topic_adherence}</p>
+              <p className="muted small">{analysisResult.summary}</p>
+            </div>
+          ) : (
+            <p className="muted">Waiting for first 30s snapshot…</p>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+
+  if (isTeacherView) {
+    return (
+      <div className="app-shell">
+        <header className="page-header">
+          <div className="page-header-row">
+            <div>
+              <h1 className="page-title">Teacher Dashboard</h1>
+              <p className="muted">
+                Moderation, flagged items, and conversation history powered by the backend websocket/REST feed.
+              </p>
+            </div>
+            <div className="page-actions">
+              <span className="status-chip">
+                <span className={`status-dot ${backendStatus}`} />
+                Backend: {connectionLabel[backendStatus] || backendStatus}
+              </span>
+              <button className="btn btn-primary" onClick={() => window.open("/", "_self")}>
+                Back to live monitor
+              </button>
+            </div>
+          </div>
+        </header>
+
+        {teacherDashboardSection}
+      </div>
+    );
+  }
 
   return (
     <div className="app-shell">
@@ -608,6 +743,13 @@ function App() {
           </button>
           <button className="btn btn-ghost" onClick={resetCounters}>
             Reset counters
+          </button>
+          <button
+            className="btn btn-ghost"
+            onClick={() => window.open(teacherUrl, "_blank", "noopener,noreferrer")}
+            title="Opens the teacher dashboard in a new tab"
+          >
+            Open Teacher Dashboard
           </button>
         </div>
       </section>
@@ -744,66 +886,6 @@ function App() {
         </section>
       </div>
 
-      <section className="panel teacher-dashboard">
-        <div className="teacher-header">
-          <div>
-            <h3 className="card-title">Teacher Dashboard</h3>
-            <p className="muted small">Moderation, full conversation, and automated insights</p>
-          </div>
-          <span className="pill muted">Auto-refresh every 30s</span>
-        </div>
-        <div className="teacher-grid">
-          <div className="teacher-card">
-            <h4 className="card-title">Flagged items ({flaggedItems.length})</h4>
-            {flaggedItems.length === 0 ? (
-              <p className="muted">No flagged language or mismatches yet.</p>
-            ) : (
-              <ul className="flagged-list">
-                {flaggedItems.map((item, idx) => (
-                  <li key={`${item.timestamp || idx}-${idx}`}>
-                    <div className="flagged-line">
-                      <span className="pill">Speaker {item.speaker ?? "?"}</span>
-                      {item.flagged_reason === "language_mismatch" ? (
-                        <span className="pill muted">
-                          Language mismatch ({item.detected_language || "?"} vs allowed {item.allowed_language || "?"})
-                        </span>
-                      ) : (
-                        <span className="pill muted">Profanity</span>
-                      )}
-                    </div>
-                    <div className="flagged-text">{item.text}</div>
-                    {item.flagged_words && (
-                      <div className="muted small">Words: {item.flagged_words.join(", ")}</div>
-                    )}
-                    <div className="muted small">
-                      Topic: {item.topic || "n/a"} | Context: {item.context || "n/a"}
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-          <div className="teacher-card">
-            <h4 className="card-title">Complete conversation</h4>
-            <div className="history">
-              <p className="history-title">Timeline</p>
-              <p className="history-text">{teacherConversationText || "No transcript yet."}</p>
-            </div>
-          </div>
-          <div className="teacher-card">
-            <h4 className="card-title">30s Analysis (mock)</h4>
-            {analysisResult ? (
-              <div className="analysis">
-                <p className="analysis-line"><strong>Participation balance:</strong> {analysisResult.participation_balance}</p>
-                <p className="analysis-line"><strong>Topic adherence:</strong> {analysisResult.topic_adherence}</p>
-                <p className="muted small">{analysisResult.summary}</p>
-              </div>
-            ) : (
-              <p className="muted">Waiting for first 30s snapshot…</p>
-            )}
-          </div>
-        </div>
-      </section>
     </div>
   );
 }

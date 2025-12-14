@@ -5,6 +5,7 @@ import re
 from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Any, Dict, List
+from collections import defaultdict
 
 from better_profanity import profanity
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -26,6 +27,9 @@ dashboard_snapshot: List[Dict[str, Any]] = []
 flagged_events: List[Dict[str, Any]] = []
 session_meta: Dict[str, str] = {"topic": "", "context": "", "allowed_language": ""}
 history_lock = asyncio.Lock()
+connections: set[WebSocket] = set()
+connections_lock = asyncio.Lock()
+flagged_tokens_by_speaker: Dict[Any, set[str]] = defaultdict(set)
 
 profanity.load_censor_words()
 
@@ -65,6 +69,32 @@ def extract_flagged_words(text: str) -> List[str]:
     return sorted(flagged)
 
 
+async def register_websocket(ws: WebSocket) -> None:
+    async with connections_lock:
+        connections.add(ws)
+
+
+async def unregister_websocket(ws: WebSocket) -> None:
+    async with connections_lock:
+        connections.discard(ws)
+
+
+async def broadcast_json(payload: Dict[str, Any]) -> None:
+    """Send a JSON payload to all active websocket connections."""
+    async with connections_lock:
+        targets = list(connections)
+    stale: list[WebSocket] = []
+    for ws in targets:
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            stale.append(ws)
+    if stale:
+        async with connections_lock:
+            for ws in stale:
+                connections.discard(ws)
+
+
 async def push_history_periodically(websocket: WebSocket, stop_event: asyncio.Event) -> None:
     """Every 30 seconds send the full history snapshot to the connected client."""
     try:
@@ -87,6 +117,7 @@ async def push_history_periodically(websocket: WebSocket, stop_event: asyncio.Ev
 @app.websocket("/monitor")
 async def monitor(websocket: WebSocket) -> None:
     await websocket.accept()
+    await register_websocket(websocket)
     stop_event = asyncio.Event()
     history_task = asyncio.create_task(push_history_periodically(websocket, stop_event))
     logger.info("Frontend monitor connected.")
@@ -132,7 +163,7 @@ async def monitor(websocket: WebSocket) -> None:
                             "flagged_reason": "language_mismatch_snapshot",
                         }
                         flagged_events.append(mismatch_entry)
-                        await websocket.send_json({"type": "flagged", "payload": mismatch_entry})
+                        await broadcast_json({"type": "flagged", "payload": mismatch_entry})
                 if normalized_allowed and normalized_allowed != "auto" and items:
                     for item in items:
                         detected_lang = item.get("detected_language")
@@ -150,7 +181,7 @@ async def monitor(websocket: WebSocket) -> None:
                                 "flagged_reason": "language_mismatch_snapshot",
                             }
                             flagged_events.append(mismatch_entry)
-                            await websocket.send_json({"type": "flagged", "payload": mismatch_entry})
+                            await broadcast_json({"type": "flagged", "payload": mismatch_entry})
                 logger.info("Received dashboard snapshot with %d entries", len(items))
                 await websocket.send_json({"type": "ack", "received": True, "mode": "snapshot"})
                 continue
@@ -186,9 +217,16 @@ async def monitor(websocket: WebSocket) -> None:
 
             flagged_words = extract_flagged_words(text)
             if flagged_words:
-                flagged_entry = {**entry, "flagged_words": flagged_words}
-                flagged_events.append(flagged_entry)
-                await websocket.send_json({"type": "flagged", "payload": flagged_entry})
+                speaker_key = str(speaker) if speaker is not None else "_unknown"
+                flagged_words = [w.lower() for w in flagged_words]
+                async with history_lock:
+                    seen_words = flagged_tokens_by_speaker[speaker_key]
+                    new_words = [w for w in flagged_words if w not in seen_words]
+                    if new_words:
+                        # seen_words.update(new_words)
+                        flagged_entry = {**entry, "flagged_words": new_words}
+                        # flagged_events.append(flagged_entry)
+                        await broadcast_json({"type": "flagged", "payload": flagged_entry})
 
             if allowed_language and detected_language:
                 normalized_allowed = allowed_language.lower().strip()
@@ -198,7 +236,7 @@ async def monitor(websocket: WebSocket) -> None:
                         "flagged_reason": "language_mismatch",
                     }
                     flagged_events.append(mismatch_entry)
-                    await websocket.send_json({"type": "flagged", "payload": mismatch_entry})
+                    await broadcast_json({"type": "flagged", "payload": mismatch_entry})
 
             await websocket.send_json({"type": "ack", "received": True})
     except WebSocketDisconnect:
@@ -206,6 +244,7 @@ async def monitor(websocket: WebSocket) -> None:
     except Exception as exc:  # pragma: no cover - transport errors
         logger.exception("Monitor websocket crashed: %s", exc)
     finally:
+        await unregister_websocket(websocket)
         stop_event.set()
         history_task.cancel()
         with suppress(Exception, asyncio.CancelledError):

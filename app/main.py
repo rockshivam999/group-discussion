@@ -24,6 +24,7 @@ app.add_middleware(
 
 dashboard_snapshot: List[Dict[str, Any]] = []
 flagged_events: List[Dict[str, Any]] = []
+session_meta: Dict[str, str] = {"topic": "", "context": "", "allowed_language": ""}
 history_lock = asyncio.Lock()
 
 profanity.load_censor_words()
@@ -71,8 +72,9 @@ async def push_history_periodically(websocket: WebSocket, stop_event: asyncio.Ev
             await asyncio.sleep(30)
             async with history_lock:
                 snapshot = list(dashboard_snapshot)
+                meta = dict(session_meta)
             try:
-                await websocket.send_json({"type": "history", "history": snapshot})
+                await websocket.send_json({"type": "history", "history": snapshot, "meta": meta})
                 logger.info("Sent history snapshot with %d entries", len(snapshot))
             except Exception as exc:  # pragma: no cover - transport errors
                 logger.warning("Failed to send history snapshot: %s", exc)
@@ -96,7 +98,7 @@ async def monitor(websocket: WebSocket) -> None:
             if flagged_events:
                 await websocket.send_json({"type": "flagged_bulk", "items": list(flagged_events)})
             if dashboard_snapshot:
-                await websocket.send_json({"type": "history", "history": list(dashboard_snapshot)})
+                await websocket.send_json({"type": "history", "history": list(dashboard_snapshot), "meta": dict(session_meta)})
         while True:
             raw = await websocket.receive_text()
             try:
@@ -107,9 +109,48 @@ async def monitor(websocket: WebSocket) -> None:
 
             if data.get("type") == "snapshot":
                 items = data.get("items") or []
+                aggregate_detected_language = data.get("detected_language")
+                allowed_language = data.get("allowed_language") or session_meta.get("allowed_language")
+                async with history_lock:
+                    session_meta["topic"] = data.get("topic") or session_meta.get("topic") or ""
+                    session_meta["context"] = data.get("context") or session_meta.get("context") or ""
+                    session_meta["allowed_language"] = data.get("allowed_language") or session_meta.get("allowed_language") or ""
                 async with history_lock:
                     dashboard_snapshot.clear()
                     dashboard_snapshot.extend(items)
+                normalized_allowed = allowed_language.lower().strip() if allowed_language else ""
+                if normalized_allowed and normalized_allowed != "auto" and aggregate_detected_language:
+                    if normalized_allowed != aggregate_detected_language.lower().strip():
+                        mismatch_entry = {
+                            "speaker": "aggregate",
+                            "text": "Aggregate language mismatch",
+                            "timestamp": utc_now_iso(),
+                            "detected_language": aggregate_detected_language,
+                            "allowed_language": allowed_language,
+                            "topic": session_meta.get("topic"),
+                            "context": session_meta.get("context"),
+                            "flagged_reason": "language_mismatch_snapshot",
+                        }
+                        flagged_events.append(mismatch_entry)
+                        await websocket.send_json({"type": "flagged", "payload": mismatch_entry})
+                if normalized_allowed and normalized_allowed != "auto" and items:
+                    for item in items:
+                        detected_lang = item.get("detected_language")
+                        if detected_lang and normalized_allowed != str(detected_lang).lower().strip():
+                            mismatch_entry = {
+                                "speaker": item.get("speaker"),
+                                "text": item.get("text"),
+                                "start": item.get("start"),
+                                "end": item.get("end"),
+                                "timestamp": item.get("timestamp") or utc_now_iso(),
+                                "detected_language": detected_lang,
+                                "allowed_language": allowed_language,
+                                "topic": session_meta.get("topic"),
+                                "context": session_meta.get("context"),
+                                "flagged_reason": "language_mismatch_snapshot",
+                            }
+                            flagged_events.append(mismatch_entry)
+                            await websocket.send_json({"type": "flagged", "payload": mismatch_entry})
                 logger.info("Received dashboard snapshot with %d entries", len(items))
                 await websocket.send_json({"type": "ack", "received": True, "mode": "snapshot"})
                 continue
@@ -125,12 +166,20 @@ async def monitor(websocket: WebSocket) -> None:
                 continue
 
             speaker = data.get("speaker")
+            allowed_language = data.get("allowed_language") or session_meta.get("allowed_language")
+            detected_language = data.get("detected_language")
+            entry_topic = data.get("topic") or session_meta.get("topic")
+            entry_context = data.get("context") or session_meta.get("context")
             entry = {
                 "speaker": speaker,
                 "text": text,
                 "start": data.get("start"),
                 "end": data.get("end"),
                 "timestamp": data.get("timestamp") or utc_now_iso(),
+                "detected_language": detected_language,
+                "allowed_language": allowed_language,
+                "topic": entry_topic,
+                "context": entry_context,
             }
             
             print("Got i websocked :",text)
@@ -140,6 +189,16 @@ async def monitor(websocket: WebSocket) -> None:
                 flagged_entry = {**entry, "flagged_words": flagged_words}
                 flagged_events.append(flagged_entry)
                 await websocket.send_json({"type": "flagged", "payload": flagged_entry})
+
+            if allowed_language and detected_language:
+                normalized_allowed = allowed_language.lower().strip()
+                if normalized_allowed != "auto" and normalized_allowed != detected_language.lower().strip():
+                    mismatch_entry = {
+                        **entry,
+                        "flagged_reason": "language_mismatch",
+                    }
+                    flagged_events.append(mismatch_entry)
+                    await websocket.send_json({"type": "flagged", "payload": mismatch_entry})
 
             await websocket.send_json({"type": "ack", "received": True})
     except WebSocketDisconnect:
@@ -157,9 +216,12 @@ async def monitor(websocket: WebSocket) -> None:
 async def get_complete_conversation() -> Dict[str, Any]:
     async with history_lock:
         snapshot = list(dashboard_snapshot)
-    return {"history": snapshot}
+        meta = dict(session_meta)
+    return {"history": snapshot, "meta": meta}
 
 
 @app.get("/flagged")
 async def get_flagged() -> Dict[str, Any]:
-    return {"flagged": flagged_events}
+    async with history_lock:
+        meta = dict(session_meta)
+    return {"flagged": flagged_events, "meta": meta}

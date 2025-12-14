@@ -17,6 +17,16 @@ const connectionLabel = {
   error: "Error"
 };
 
+const allowedLanguageOptions = [
+  { value: "en", label: "English" },
+  { value: "es", label: "Spanish" },
+  { value: "fr", label: "French" },
+  { value: "de", label: "German" },
+  { value: "hi", label: "Hindi" },
+  { value: "zh", label: "Chinese" },
+  { value: "auto", label: "Auto-detect" }
+];
+
 function App() {
   const [wsUrl, setWsUrl] = useState(defaultWsUrl);
   const [connectionStatus, setConnectionStatus] = useState("disconnected");
@@ -32,6 +42,11 @@ function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [backendStatus, setBackendStatus] = useState("disconnected");
   const [flaggedItems, setFlaggedItems] = useState([]);
+  const [topic, setTopic] = useState("Nature");
+  const [contextText, setContextText] = useState("Mountains, Sea, Air, Clouds");
+  const [allowedLanguage, setAllowedLanguage] = useState("en");
+  const [analysisResult, setAnalysisResult] = useState(null);
+  const [teacherHistory, setTeacherHistory] = useState([]);
   const socketRef = useRef(null);
   const backendSocketRef = useRef(null);
   const backendReconnectRef = useRef(null);
@@ -42,6 +57,17 @@ function App() {
   const conversationRef = useRef([]);
   const mediaStreamRef = useRef(null);
   const recorderRef = useRef(null);
+
+  const backendHttpBase = useMemo(() => {
+    try {
+      const url = new URL(backendWsUrl);
+      url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+      url.pathname = "/";
+      return url.toString().replace(/\/$/, "");
+    } catch (err) {
+      return "";
+    }
+  }, []);
 
   const conversationHistoryText = useMemo(() => {
     return conversation
@@ -54,6 +80,18 @@ function App() {
       .join("\n");
   }, [conversation]);
 
+  const teacherConversationText = useMemo(() => {
+    const lines = teacherHistory.length ? teacherHistory : conversation;
+    return lines
+      .map((line) => {
+        const speaker = line.speaker !== undefined ? line.speaker : "?";
+        const main = line.text || "";
+        const translation = line.translation ? ` [${line.translation}]` : "";
+        return `S${speaker}: ${main}${translation}`;
+      })
+      .join("\n");
+  }, [conversation, teacherHistory]);
+
   const sendDeltaToBackend = useCallback((payload) => {
     const socket = backendSocketRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
@@ -62,6 +100,41 @@ function App() {
     } catch (err) {
       console.warn("Could not send delta to backend", err);
     }
+  }, []);
+
+  const determineAggregateLanguage = useCallback((lines = []) => {
+    const counts = lines.reduce((acc, line) => {
+      const lang = (line.detected_language || "").toLowerCase().trim();
+      if (!lang) return acc;
+      acc[lang] = (acc[lang] || 0) + 1;
+      return acc;
+    }, {});
+    let topLang = "";
+    let topCount = 0;
+    Object.entries(counts).forEach(([lang, count]) => {
+      if (count > topCount) {
+        topLang = lang;
+        topCount = count;
+      }
+    });
+    return topLang || "";
+  }, []);
+
+  const mockAnalyzeSnapshot = useCallback((snapshot, meta) => {
+    const speakers = Array.from(new Set(snapshot.map((l) => l.speaker).filter((s) => s !== undefined)));
+    const totalLines = snapshot.length;
+    const participationBalance =
+      speakers.length > 1
+        ? `Voices observed: ${speakers.join(", ")}. Distribution looks balanced over ${totalLines} turns.`
+        : `Single dominant voice across ${totalLines} turns.`;
+    const topicNote = meta.topic
+      ? `Appears mostly on topic "${meta.topic}" with light drift detected.`
+      : "Topic not set; cannot evaluate adherence.";
+    return {
+      participation_balance: participationBalance,
+      topic_adherence: topicNote,
+      summary: "Mock analysis placeholder. Replace with external LLM call."
+    };
   }, []);
 
   const updateLatestChunk = useCallback((historyText, lastLineMeta = null) => {
@@ -89,6 +162,10 @@ function App() {
         speaker: lastLineMeta.speaker ?? null,
         start: lastLineMeta.start,
         end: lastLineMeta.end,
+        detected_language: lastLineMeta.detected_language,
+        topic,
+        context: contextText,
+        allowed_language: allowedLanguage,
         timestamp: lastLineMeta.timestamp || new Date().toISOString()
       });
     }
@@ -108,7 +185,7 @@ function App() {
 
       return next;
     });
-  }, []);
+  }, [allowedLanguage, contextText, sendDeltaToBackend, topic]);
 
   const sendSnapshotToBackend = useCallback(() => {
     const socket = backendSocketRef.current;
@@ -122,14 +199,29 @@ function App() {
       detected_language: line.detected_language,
       translation: line.translation,
       timestamp: line.timestamp || new Date().toISOString(),
+      allowed_language: allowedLanguage,
+      topic,
+      context: contextText
     }));
 
+    const aggregateDetectedLanguage = determineAggregateLanguage(snapshot);
+    const payload = {
+      type: "snapshot",
+      items: snapshot,
+      topic,
+      context: contextText,
+      allowed_language: allowedLanguage,
+      detected_language: aggregateDetectedLanguage
+    };
+
     try {
-      socket.send(JSON.stringify({ type: "snapshot", items: snapshot }));
+      socket.send(JSON.stringify(payload));
     } catch (err) {
       console.warn("Could not send snapshot to backend", err);
     }
-  }, []);
+    setTeacherHistory(snapshot);
+    setAnalysisResult(mockAnalyzeSnapshot(snapshot, payload));
+  }, [allowedLanguage, contextText, determineAggregateLanguage, mockAnalyzeSnapshot, topic]);
 
   const stopRecording = useCallback(() => {
     if (recorderRef.current) {
@@ -371,7 +463,7 @@ function App() {
             setFlaggedItems(payload.items);
           }
           if (payload.type === "history" && payload.history) {
-            console.log("Backend history snapshot:", payload.history);
+            setTeacherHistory(payload.history);
           }
         } catch (err) {
           console.warn("Could not parse backend message", err);
@@ -431,6 +523,37 @@ function App() {
   }, [connectBackend]);
 
   useEffect(() => {
+    if (!backendHttpBase || backendStatus !== "connected") return;
+    const fetchData = async () => {
+      try {
+        const flaggedRes = await fetch(`${backendHttpBase}/flagged`);
+        const flaggedJson = await flaggedRes.json();
+        if (Array.isArray(flaggedJson.flagged)) {
+          setFlaggedItems(flaggedJson.flagged);
+        }
+        if (flaggedJson.meta) {
+          if (flaggedJson.meta.topic) setTopic(flaggedJson.meta.topic);
+          if (flaggedJson.meta.context) setContextText(flaggedJson.meta.context);
+          if (flaggedJson.meta.allowed_language) setAllowedLanguage(flaggedJson.meta.allowed_language);
+        }
+      } catch (err) {
+        console.warn("Could not fetch flagged items", err);
+      }
+
+      try {
+        const historyRes = await fetch(`${backendHttpBase}/complete-conversation`);
+        const historyJson = await historyRes.json();
+        if (Array.isArray(historyJson.history)) {
+          setTeacherHistory(historyJson.history);
+        }
+      } catch (err) {
+        console.warn("Could not fetch conversation history", err);
+      }
+    };
+    fetchData();
+  }, [backendHttpBase, backendStatus]);
+
+  useEffect(() => {
     const interval = setInterval(() => {
       sendSnapshotToBackend();
     }, 30000);
@@ -486,6 +609,41 @@ function App() {
           <button className="btn btn-ghost" onClick={resetCounters}>
             Reset counters
           </button>
+        </div>
+      </section>
+
+      <section className="panel meta-bar">
+        <div className="field">
+          <label className="field-label">Discussion topic</label>
+          <input
+            className="input-field"
+            value={topic}
+            onChange={(e) => setTopic(e.target.value)}
+            placeholder="e.g., Nature"
+          />
+        </div>
+        <div className="field">
+          <label className="field-label">Context</label>
+          <input
+            className="input-field"
+            value={contextText}
+            onChange={(e) => setContextText(e.target.value)}
+            placeholder="Mountains, Sea, Air, Clouds…"
+          />
+        </div>
+        <div className="field">
+          <label className="field-label">Allowed language</label>
+          <select
+            className="input-field"
+            value={allowedLanguage}
+            onChange={(e) => setAllowedLanguage(e.target.value)}
+          >
+            {allowedLanguageOptions.map((opt) => (
+              <option key={opt.value} value={opt.value}>
+                {opt.label}
+              </option>
+            ))}
+          </select>
         </div>
       </section>
 
@@ -585,6 +743,67 @@ function App() {
           </div>
         </section>
       </div>
+
+      <section className="panel teacher-dashboard">
+        <div className="teacher-header">
+          <div>
+            <h3 className="card-title">Teacher Dashboard</h3>
+            <p className="muted small">Moderation, full conversation, and automated insights</p>
+          </div>
+          <span className="pill muted">Auto-refresh every 30s</span>
+        </div>
+        <div className="teacher-grid">
+          <div className="teacher-card">
+            <h4 className="card-title">Flagged items ({flaggedItems.length})</h4>
+            {flaggedItems.length === 0 ? (
+              <p className="muted">No flagged language or mismatches yet.</p>
+            ) : (
+              <ul className="flagged-list">
+                {flaggedItems.map((item, idx) => (
+                  <li key={`${item.timestamp || idx}-${idx}`}>
+                    <div className="flagged-line">
+                      <span className="pill">Speaker {item.speaker ?? "?"}</span>
+                      {item.flagged_reason === "language_mismatch" ? (
+                        <span className="pill muted">
+                          Language mismatch ({item.detected_language || "?"} vs allowed {item.allowed_language || "?"})
+                        </span>
+                      ) : (
+                        <span className="pill muted">Profanity</span>
+                      )}
+                    </div>
+                    <div className="flagged-text">{item.text}</div>
+                    {item.flagged_words && (
+                      <div className="muted small">Words: {item.flagged_words.join(", ")}</div>
+                    )}
+                    <div className="muted small">
+                      Topic: {item.topic || "n/a"} | Context: {item.context || "n/a"}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+          <div className="teacher-card">
+            <h4 className="card-title">Complete conversation</h4>
+            <div className="history">
+              <p className="history-title">Timeline</p>
+              <p className="history-text">{teacherConversationText || "No transcript yet."}</p>
+            </div>
+          </div>
+          <div className="teacher-card">
+            <h4 className="card-title">30s Analysis (mock)</h4>
+            {analysisResult ? (
+              <div className="analysis">
+                <p className="analysis-line"><strong>Participation balance:</strong> {analysisResult.participation_balance}</p>
+                <p className="analysis-line"><strong>Topic adherence:</strong> {analysisResult.topic_adherence}</p>
+                <p className="muted small">{analysisResult.summary}</p>
+              </div>
+            ) : (
+              <p className="muted">Waiting for first 30s snapshot…</p>
+            )}
+          </div>
+        </div>
+      </section>
     </div>
   );
 }

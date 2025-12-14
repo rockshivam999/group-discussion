@@ -13,3 +13,6 @@ dist/
 *.log
 *.sqlite
 .idea
+hf_token_temp
+WhisperLiveKit/hf_token_temp
+./WhisperLiveKit/hf_token_temp

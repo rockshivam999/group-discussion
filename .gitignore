@@ -16,3 +16,4 @@ dist/
 hf_token_temp
 WhisperLiveKit/hf_token_temp
 ./WhisperLiveKit/hf_token_temp
+.env

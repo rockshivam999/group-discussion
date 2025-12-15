@@ -134,23 +134,6 @@ function App() {
     return topLang || "";
   }, []);
 
-  const mockAnalyzeSnapshot = useCallback((snapshot, meta) => {
-    const speakers = Array.from(new Set(snapshot.map((l) => l.speaker).filter((s) => s !== undefined)));
-    const totalLines = snapshot.length;
-    const participationBalance =
-      speakers.length > 1
-        ? `Voices observed: ${speakers.join(", ")}. Distribution looks balanced over ${totalLines} turns.`
-        : `Single dominant voice across ${totalLines} turns.`;
-    const topicNote = meta.topic
-      ? `Appears mostly on topic "${meta.topic}" with light drift detected.`
-      : "Topic not set; cannot evaluate adherence.";
-    return {
-      participation_balance: participationBalance,
-      topic_adherence: topicNote,
-      summary: "Mock analysis placeholder. Replace with external LLM call."
-    };
-  }, []);
-
   const updateLatestChunk = useCallback(
     (stableText, lastLineMeta = null) => {
       const trimmed = (stableText || "").trim();
@@ -260,8 +243,8 @@ function App() {
       console.warn("Could not send snapshot to backend", err);
     }
     setTeacherHistory(snapshot);
-    setAnalysisResult(mockAnalyzeSnapshot(snapshot, payload));
-  }, [allowedLanguage, contextText, determineAggregateLanguage, mockAnalyzeSnapshot, topic]);
+    setAnalysisResult(null);
+  }, [allowedLanguage, contextText, determineAggregateLanguage, topic]);
 
   const stopRecording = useCallback(() => {
     if (recorderRef.current) {
@@ -499,8 +482,12 @@ function App() {
           }
           if (payload.type === "history" && payload.history) {
             setTeacherHistory(payload.history);
-            const meta = payload.meta || {};
-            setAnalysisResult(mockAnalyzeSnapshot(payload.history, meta));
+            if (payload.analysis) {
+              setAnalysisResult(payload.analysis);
+            }
+          }
+          if (payload.type === "analysis" && payload.payload) {
+            setAnalysisResult(payload.payload);
           }
         } catch (err) {
           console.warn("Could not parse backend message", err);
@@ -510,7 +497,7 @@ function App() {
       console.warn("Could not open backend websocket", err);
       setBackendStatus("error");
     }
-  }, [backendWsUrl, isTeacherView, mockAnalyzeSnapshot, sendSnapshotToBackend]);
+  }, [backendWsUrl, isTeacherView, sendSnapshotToBackend]);
 
   const disconnect = useCallback(() => {
     if (socketRef.current) {
@@ -584,7 +571,9 @@ function App() {
         const historyJson = await historyRes.json();
         if (Array.isArray(historyJson.history)) {
           setTeacherHistory(historyJson.history);
-          setAnalysisResult(mockAnalyzeSnapshot(historyJson.history, historyJson.meta || {}));
+        }
+        if (historyJson.analysis) {
+          setAnalysisResult(historyJson.analysis);
         }
       } catch (err) {
         console.warn("Could not fetch conversation history", err);
@@ -662,13 +651,16 @@ function App() {
           </div>
         </div>
         <div className="teacher-card">
-          <h4 className="card-title">30s Analysis (mock)</h4>
-          {analysisResult ? (
+          <h4 className="card-title">30s Analysis (LLM)</h4>
+          {analysisResult?.analysis ? (
             <div className="analysis">
-              <p className="analysis-line"><strong>Participation balance:</strong> {analysisResult.participation_balance}</p>
-              <p className="analysis-line"><strong>Topic adherence:</strong> {analysisResult.topic_adherence}</p>
-              <p className="muted small">{analysisResult.summary}</p>
+              <p className="muted small">
+                Model: {analysisResult.model || "phi4"} | Updated: {analysisResult.timestamp || "—"}
+              </p>
+              <p className="analysis-text">{analysisResult.analysis}</p>
             </div>
+          ) : analysisResult?.error ? (
+            <p className="muted">Analysis unavailable: {analysisResult.error}</p>
           ) : (
             <p className="muted">Waiting for first 30s snapshot…</p>
           )}

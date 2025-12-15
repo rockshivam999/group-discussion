@@ -7,17 +7,23 @@ services:
       - "8000:8000"
     environment:
       - PYTHONUNBUFFERED=1
+      # WhisperLiveKit Config
       - WLK_HOST=whisperlivekit
       - WLK_PORT=8000
       - WLK_IMAGE=whisperlivekit:local
       - WLK_SINGLETON=1
       - WLK_MANAGED=0
       - WLK_ARGS=--diarization --language en
+      # Phi-4 LLM Config
+      - LLM_HOST=phi4
+      - LLM_PORT=11434
+      - LLM_MODEL=phi4
     volumes:
       - ./app:/app/app
       - ./models:/app/models
     depends_on:
       - whisperlivekit
+      - phi4
 
   frontend:
     build:
@@ -38,3 +44,44 @@ services:
       - PORT=8000
     ports:
       - "8100:8000"
+
+  # --- New Services Below ---
+
+  # 1. The Inference Server (Ollama)
+  phi4:
+    image: ollama/ollama:latest
+    container_name: phi4_server
+    ports:
+      - "11434:11434"
+    volumes:
+      # Persist models so they aren't re-downloaded on restart
+      - ollama_storage:/root/.ollama
+    restart: unless-stopped
+    # Optional: Enable GPU if available (uncomment below)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # 2. The Model Loader (Runs once to ensure phi4 is pulled)
+  phi4-init:
+    image: curlimages/curl
+    container_name: phi4_model_loader
+    depends_on:
+      - phi4
+    restart: on-failure
+    # Commands to wait for server and trigger pull
+    command: >
+      /bin/sh -c "
+      echo 'Waiting for Phi-4 service to be ready...';
+      while ! curl -s http://phi4:11434/api/tags > /dev/null; do sleep 2; done;
+      echo 'Phi-4 service ready. triggering pull for model: phi4';
+      curl -X POST http://phi4:11434/api/pull -d '{\"name\": \"phi4\"}';
+      echo 'Model pull request sent. Server will download in background.';
+      "
+
+volumes:
+  ollama_storage:
